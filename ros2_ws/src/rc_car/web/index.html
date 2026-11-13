@@ -1,0 +1,24 @@
+<!doctype html>
+<html lang="ko"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>RC · Vehicle Console</title><link rel="stylesheet" href="/style.css"><script defer src="/app.js"></script></head>
+<body><header><div><small>RASPBERRY PI · ROS 2</small><h1>Vehicle Console</h1></div><div id="connection" class="badge">연결 대기</div><button id="estop" class="danger">비상정지 · SPACE</button></header>
+<main><section class="map-panel"><div class="map-heading"><div><small>LIVE MAPPING</small><h2>주행 공간</h2></div><span id="slam" class="badge">SLAM 준비 안 됨</span></div>
+<div class="map-wrap"><canvas id="map"></canvas><div id="mapEmpty">수신한 지도가 없습니다.<br><small>엔코더 · 조향 보정 · TF가 준비되어야 지도 생성이 가능합니다.</small></div></div>
+<div class="map-footer"><span id="pose">위치 데이터 없음</span><span>화살표: 차량 · 회색: 미탐색</span></div>
+<div class="save"><input id="mapName" placeholder="지도 이름 (영문/숫자)" maxlength="64"><button id="save">지도 + Pose graph 저장</button><span id="mapAge">—</span></div>
+<p class="note">지도는 마지막 수신 자료입니다. SLAM 상태가 준비되지 않으면 차량 위치를 숨깁니다. 조향은 명령 기반 추정값이며 실제 각도 센서는 없습니다.</p></section>
+<aside><section class="card"><div class="row"><h2>제어권</h2><span id="mode" class="badge">MANUAL</span></div><p id="owner">관찰 모드</p>
+<div class="buttons"><button id="claim">제어권 획득</button><button id="release">반납</button><button id="arm">정지 해제 / 활성화</button><button id="stop">정지</button></div>
+<div class="row"><label>제어 방식 <select id="control"><option value="OPEN_LOOP">Open-loop PWM</option><option value="PI">PI · 엔코더 RPM</option></select></label><button disabled title="알고리즘 미구현">AUTO_PARK 잠김</button></div>
+<p id="reason" class="note">시작 시 출력 차단</p><div class="keys"><kbd>W / ↑</kbd><kbd>A / ←</kbd><kbd>S / ↓</kbd><kbd>D / →</kbd></div>
+<p class="note">키를 누르는 동안만 주행합니다. 키 해제 시 모터 정지. 탭 전환·포커스 상실 시 비활성화. 입력칸에서는 키보드 조종이 차단됩니다.</p></section>
+<section class="card"><h2>출력 및 목표</h2><label>주행 목표 <span id="driveValue">0%</span><input id="drive" type="range" min="0" max="100" value="0"></label>
+<label>모터 1 최대 RPM <output id="rpm1Value">0</output><input id="rpm1" type="range" min="0" max="0" value="0" step="0.1"></label>
+<label>모터 2 최대 RPM <output id="rpm2Value">0</output><input id="rpm2" type="range" min="0" max="0" value="0" step="0.1"></label>
+<label>최대 PWM <output id="pwmValue">0%</output><input id="pwm" type="range" min="0" max="0" value="0" step="0.01"></label>
+<label>조향 범위 <output id="steerValue">0 rad</output><input id="steer" type="range" min="0" max="0" value="0" step="0.01"></label><p class="note">RPM은 감속기 출력축 기준입니다. 제한값 변경 후 다시 활성화하십시오.</p></section>
+</aside><section class="card telemetry"><h2>차량 텔레메트리 <span id="fresh" class="badge">데이터 없음</span></h2>
+<div class="sensor-grid"><div><h3>모터 1 · LEFT</h3><dl id="motor0"></dl></div><div><h3>모터 2 · RIGHT</h3><dl id="motor1"></dl></div>
+<div><h3>트레일러 · MT6701</h3><strong id="trailer">—</strong><p id="trailerStatus">영점 미설정</p><button id="zero">현재 자세를 영점으로</button><h3>조향 서보</h3><p id="servo">—</p></div>
+<div><h3>초음파 · US-100</h3><dl id="ranges"></dl></div></div><p id="fault" class="error"></p></section>
+<section class="card log"><h2>명령 결과</h2><pre id="events">연결 중…</pre></section></main><footer>로컬 네트워크 전용 · 실차 검증 전 · AUTO_PARK 알고리즘 없음</footer></body></html>

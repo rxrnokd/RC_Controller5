@@ -1,0 +1,115 @@
+# All vehicle hardware and operational settings. BCM numbering, not header pins.
+# null means unknown; never replace it with a guessed calibration.
+hardware:
+  enabled: false
+  gpiochip: 0
+  wiring_verified: false
+  motor_power_verified: false
+  external_stop_verified: false
+  pwm_hz: 1000                 # commissioning choice; scope-check under SLAM load
+  pwm_lease_s: 0.10            # finite pulse train; does not run forever on SIGKILL
+  reversal_deadtime_s: 0.20
+  max_pwm: 0.0                 # operator-qualified duty ceiling, 0..0.99 (finite LOW-ending pulses)
+  slew_per_s: 0.5
+  control_hz: 50
+  feedback_timeout_s: 0.6
+  encoder_stall_s: 0.5
+  encoder_demand_rpm: 1.0
+  encoder_max_invalid: 0
+  wheel_diameter_m: 0.075
+  motors:
+    - name: left
+      pwm: [16, 20]
+      encoder: [4, 14]
+      encoder_enabled: false
+      encoder_verified: false
+      counts_per_motor_rev: 44   # HiWonder same-model documentation: 11 PPR x4; verify this unit
+      gear_ratio: 30.0           # attachment says 1:30; verify actual motor variant
+      gear_ratio_verified: false
+      direction: 1
+      encoder_direction: 1
+      max_rpm: null              # gearbox OUTPUT shaft RPM, not rotor RPM
+      kp: 0.0                   # duty / output-shaft RPM
+      ki: 0.0                   # duty / (output-shaft RPM * second)
+      pi_verified: false
+    - name: right
+      pwm: [21, 26]
+      encoder: [15, 18]
+      encoder_enabled: false
+      encoder_verified: false
+      counts_per_motor_rev: 44
+      gear_ratio: 30.0
+      gear_ratio_verified: false
+      direction: 1
+      encoder_direction: 1
+      max_rpm: null
+      kp: 0.0
+      ki: 0.0
+      pi_verified: false
+servo:
+  enabled: false
+  calibrated: false
+  gpio: 13
+  pwmchip: /sys/class/pwm/pwmchip0
+  channel: 1                  # verify sysfs mapping after dtoverlay=pwm,pin=13,func=4
+  frequency_hz: 50             # HiWonder LD-1501MG documentation: 20ms period; qualify actual unit
+  calibration: []              # ordered [road-wheel angle rad, pulse us], >=3 points incl 0
+  max_angle_rad: null          # measured road-wheel limit, not servo's 0..180 degrees
+  slew_rad_s: 0.5
+  hold_on_stop: true           # hold last steering; never snap to centre on emergency stop
+trailer:
+  enabled: false
+  verified: false
+  a: 19
+  b: 10
+  z: 9
+  ppr: null                   # actual EEPROM ABZ setting, x4 handled by code
+  direction: 1
+  offset_rad: 0.0
+  index_angle_rad: null        # known mechanical index angle, otherwise Z is diagnostic only
+ultrasonic:
+  enabled: false
+  electrical_verified: false
+  interval_s: 0.065            # sequential ping; one sensor at a time
+  timeout_s: 0.030
+  speed_of_sound_m_s: 343.0    # ambient-temperature approximation
+  min_m: 0.02
+  max_m: 4.5
+  field_of_view_rad: 0.2618
+  sensors:
+    - {name: us1, trig: 17, echo: 27}
+    - {name: us2, trig: 22, echo: 23}
+    - {name: us3, trig: 24, echo: 25}
+    - {name: us4, trig: 5, echo: 6}
+geometry:
+  verified: false
+  layout: rear_axle_left_right # controller/odometry assume both driven wheels on rear axle
+  wheelbase_m: null
+  track_m: null
+  steering_command_estimate_allowed: false
+  odom_pose_variance: [0.05, 0.05, 0.2] # model uncertainty, not measured accuracy
+  odom_twist_variance: [0.1, 0.3]
+lidar:
+  enabled: false
+  serial_port: /dev/ttyUSB0
+  serial_baudrate: 460800
+  frame: laser
+  mount_verified: false
+  xyz_rpy: [null, null, null, null, null, null]
+slam:
+  enabled: false
+  params_file: /project/config/slam.yaml # existing file: never overwritten
+  maps_dir: /project/maps
+  localization: false
+  posegraph: null              # absolute path without .posegraph / .data suffix
+network:
+  bind: 0.0.0.0
+  port: 8080
+  allowed_cidrs: [127.0.0.0/8, '::1/128'] # add actual Wi-Fi subnet before remote use
+  command_timeout_s: 0.30
+  max_command_age_s: 0.30
+  state_hz: 10
+  map_period_s: 2.0
+  max_map_cells: 2000000
+  max_clients: 4
+  max_messages_per_s: 40

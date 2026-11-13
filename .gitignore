@@ -1,0 +1,13 @@
+__pycache__/
+*.pyc
+tmp/
+.tools/
+ros2_ws/build/
+ros2_ws/install/
+ros2_ws/log/
+.rc_build/
+.rc_install/
+.rc_log/
+*.pdf
+*.png
+*.txt
