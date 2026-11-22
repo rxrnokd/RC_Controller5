@@ -1,4 +1,4 @@
-"""Future parking algorithm transport only. No planning, fake telemetry, or automatic driving.
+"""WebSocket transport shared by the observer and laptop parking worker.
 Requires aiohttp on the algorithm laptop; ordinary browser use needs no installation.
 """
 import asyncio
@@ -16,6 +16,7 @@ class VehicleClient:
         self.state = self.map = None
         self.pending = {}
         self.owns_control = False
+        self.hello = {}
 
     async def __aenter__(self):
         self.http = ClientSession()
@@ -33,7 +34,9 @@ class VehicleClient:
             if message.type != WSMsgType.TEXT:
                 break
             payload = message.json()
-            if payload['type'] == 'state':
+            if payload['type'] == 'hello':
+                self.hello = payload
+            elif payload['type'] == 'state':
                 self.state = payload
                 self.server_time = payload['server_time']
                 self.received_at = time.monotonic()

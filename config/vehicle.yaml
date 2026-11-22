@@ -113,3 +113,27 @@ network:
   max_map_cells: 2000000
   max_clients: 4
   max_messages_per_s: 40
+parking:
+  commissioned: false       # enable only after encoder repair and physical acceptance tests
+  hitch_back_m: null        # rear axle to hitch, positive towards rear
+  drawbar_m: null           # hitch to trailer axle
+  car_front_m: null         # body extents measured from rear axle
+  car_back_m: null
+  car_width_m: null
+  trailer_front_m: null     # body extents measured from trailer axle
+  trailer_back_m: null
+  trailer_width_m: null
+  max_beta_rad: null        # beta = car yaw minus trailer yaw
+  max_speed_m_s: null
+  max_accel_m_s2: null
+  clearance_m: null         # physical clearance including uncertainty
+  sonar_stop_m: null        # minimum qualified distance including stopping latency
+  encoder_proof_age_s: null # maximum age of a real edge on each wheel before AUTO start
+  max_xy_variance: null     # accepted scan-match position variance (m²)
+  max_yaw_variance: null    # accepted scan-match heading variance (rad²)
+  pos_tol_m: 0.05           # commissioning targets, not achieved accuracy
+  yaw_tol_rad: 0.10
+  stop_speed_m_s: 0.015
+  deviation_m: 0.20
+  max_nodes: 16000
+  search_seconds: 15

@@ -16,6 +16,7 @@ from rclpy.qos import QoSProfile, DurabilityPolicy, ReliabilityPolicy, qos_profi
 from std_msgs.msg import String
 from sensor_msgs.msg import LaserScan
 from nav_msgs.msg import OccupancyGrid, Odometry
+from geometry_msgs.msg import PoseWithCovarianceStamped
 from tf2_ros import Buffer, TransformListener, TransformException
 from slam_toolbox.srv import SaveMap, SerializePoseGraph
 from ament_index_python.packages import get_package_share_directory
@@ -35,6 +36,11 @@ class Bridge(Base):
         self.latest, self.times = {}, {}
         self.clients = {}
         self.grid, self.grid_id = None, 0
+        self.paths = None
+        self.health = self.create_publisher(String, '/rc/localization_health', LATEST)
+        self.create_subscription(String,'/rc/parking_paths',self.parking_paths,LATEST)
+        self.create_subscription(PoseWithCovarianceStamped,'/pose',self.scan_match,qos_profile_sensor_data)
+        self.create_timer(0.1,self.publish_health)
         self.map_error = None
         for topic, key in (('/rc/state', 'vehicle'), ('/rc/command', 'command'), ('/rc/odom_status', 'odometry_status')):
             self.create_subscription(String, topic, lambda msg, k=key: self.cache(k, json.loads(msg.data)), LATEST)
@@ -64,25 +70,65 @@ class Bridge(Base):
     def odom(self, msg):
         self.cache('odom', {'x': msg.pose.pose.position.x, 'y': msg.pose.pose.position.y,
                             'yaw': yaw(msg.pose.pose.orientation), 'speed_m_s': msg.twist.twist.linear.x,
-                            'frame': msg.header.frame_id})
+                            'frame': msg.header.frame_id, 'child_frame': msg.child_frame_id,
+                            'stamp_s': Time.from_msg(msg.header.stamp).nanoseconds/1e9})
+
+    def parking_paths(self, msg):
+        self.paths = json.loads(msg.data)
+
+    def scan_match(self, msg):
+        if msg.header.frame_id == 'map':
+            p = msg.pose.pose
+            values = [p.position.x,p.position.y,yaw(p.orientation),*[msg.pose.covariance[i] for i in (0,7,35)]]
+            if all(map(math.isfinite,values)):
+                self.cache('scan_match',dict(x=values[0],y=values[1],yaw=values[2],variance=values[3:],
+                                             stamp_s=Time.from_msg(msg.header.stamp).nanoseconds/1e9))
+
+    def publish_health(self):
+        state = self.telemetry(None)
+        p = self.cfg.get('parking',{})
+        match = self.latest.get('scan_match') or {}
+        stamp_now = self.get_clock().now().nanoseconds/1e9
+        recent = all(0 <= stamp_now - self.latest.get(k,{}).get('stamp_s',0) < 0.5
+                     for k in ('scan_match','odom','scan'))
+        variances = match.get('variance',[])
+        limits = [p.get('max_xy_variance'),p.get('max_xy_variance'),p.get('max_yaw_variance')]
+        good = len(variances)==3 and all(isinstance(limit,(int,float)) and 0 < v <= limit for v,limit in zip(variances,limits))
+        odom = self.latest.get('odom',{})
+        scan = self.latest.get('scan',{})
+        sources_ok = (odom.get('frame')=='odom' and odom.get('child_frame')=='base_link'
+                      and scan.get('frame')==self.cfg['lidar']['frame'] and scan.get('has_returns')
+                      and state['map_pose'] and state['map_pose']['tf_age_s'] < 0.5)
+        self.send(self.health,dict(valid=bool(state['slam_ready'] and not self.map_error and recent and good and sources_ok),
+                                   at=time.monotonic(),version=self.grid_id,pose=state['map_pose']))
 
     def scan(self, msg):
-        self.cache('scan', {'frame': msg.header.frame_id, 'angle_min': msg.angle_min,
+        ranges = [v if math.isfinite(v) and msg.range_min <= v <= msg.range_max else None for v in msg.ranges]
+        self.cache('scan', {'frame': msg.header.frame_id, 'stamp_s': Time.from_msg(msg.header.stamp).nanoseconds/1e9, 'angle_min': msg.angle_min,
                             'angle_increment': msg.angle_increment,
-                            'ranges': [v if math.isfinite(v) and msg.range_min <= v <= msg.range_max else None for v in msg.ranges]})
+                            'ranges': ranges, 'has_returns': any(v is not None for v in ranges)})
 
     def map(self, msg):
         if msg.header.frame_id != 'map' or msg.info.width * msg.info.height > self.cfg['network']['max_map_cells']:
             self.map_error = 'map frame/size rejected'
             return
-        if msg.info.resolution <= 0 or len(msg.data) != msg.info.width * msg.info.height:
+        if (not msg.info.width or not msg.info.height or not math.isfinite(msg.info.resolution)
+                or msg.info.resolution <= 0 or len(msg.data) != msg.info.width * msg.info.height):
             self.map_error = 'invalid occupancy grid'
+            return
+        origin = [msg.info.origin.position.x, msg.info.origin.position.y, yaw(msg.info.origin.orientation)]
+        if not all(map(math.isfinite,origin)):
+            self.map_error = 'invalid map origin'
+            return
+        cells = list(msg.data)
+        if self.grid and self.grid['data']==cells and self.grid['width']==msg.info.width and self.grid['height']==msg.info.height and self.grid['resolution']==msg.info.resolution and self.grid['origin']==origin:
+            self.times['map']=time.monotonic()
+            self.map_error=None
             return
         self.grid_id += 1
         self.grid = {'type': 'map', 'version': self.grid_id, 'frame': 'map',
                      'width': msg.info.width, 'height': msg.info.height, 'resolution': msg.info.resolution,
-                     'origin': [msg.info.origin.position.x, msg.info.origin.position.y, yaw(msg.info.origin.orientation)],
-                     'data': list(msg.data)}
+                     'origin': origin, 'data': cells}
         self.map_error = None
         self.times['map'] = time.monotonic()
 
@@ -103,7 +149,9 @@ class Bridge(Base):
         ready = bool(odom_valid and pose and self.grid and age.get('scan', 999) < 0.6)
         return {'v': 1, 'type': 'state', 'server_time': now, 'session': session,
                 'data': self.latest, 'age_s': age, 'map_pose': pose if ready else None,
-                'slam_ready': ready, 'map_error': self.map_error, 'auto_available': False}
+                'ros_time_s': self.get_clock().now().nanoseconds/1e9,
+                'map_version':self.grid_id, 'slam_ready': ready, 'map_error': self.map_error,
+                'auto_available': self.latest.get('command',{}).get('auto_available',False)}
 
     def request(self, session, payload):
         self.send(self.requests, dict(payload, session=session, received=time.monotonic()))
@@ -183,7 +231,7 @@ async def serve(node):
     async def websocket(request):
         if len(node.clients) >= cfg['max_clients']:
             raise web.HTTPServiceUnavailable(text='client limit')
-        ws = web.WebSocketResponse(heartbeat=2, max_msg_size=4096)
+        ws = web.WebSocketResponse(heartbeat=2, max_msg_size=65536)
         await ws.prepare(request)
         session = uuid.uuid4().hex  # routing/ownership ID, not an authentication token
         queue = asyncio.Queue(maxsize=32)
@@ -192,15 +240,20 @@ async def serve(node):
 
         async def sender():
             map_version, map_at = -1, 0.0
+            path_id = None
             hello = {'type': 'hello', 'v': 1, 'session': session,
                      'limits': {'pwm': node.cfg['hardware']['max_pwm'],
                                 'rpm': [m['max_rpm'] or 0 for m in node.cfg['hardware']['motors']],
                                 'steering': node.cfg['servo']['max_angle_rad'] or 0}}
+            hello['parking_config'] = {k:node.cfg[k] for k in ('geometry','servo','parking') if k in node.cfg}
             await ws.send_str(dumps(hello))
             while not ws.closed:
                 while not queue.empty():
                     await asyncio.wait_for(ws.send_str(dumps(queue.get_nowait())), 0.3)
                 await asyncio.wait_for(ws.send_str(dumps(node.telemetry(session))), 0.3)
+                if node.paths and path_id != node.paths['job_id']:
+                    path_id=node.paths['job_id']
+                    await asyncio.wait_for(ws.send_str(dumps(node.paths)),0.5)
                 if node.grid and map_version != node.grid_id and time.monotonic() - map_at >= cfg['map_period_s']:
                     map_version, map_at = node.grid_id, time.monotonic()
                     await asyncio.wait_for(ws.send_str(dumps(node.grid)), 0.5)

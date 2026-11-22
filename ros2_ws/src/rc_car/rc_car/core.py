@@ -112,6 +112,19 @@ def load_config(path):
         require(g['layout'] == 'rear_axle_left_right')
         number(g['wheelbase_m'], 'wheelbase_m', 0.01)
         number(g['track_m'], 'track_m', 0.01)
+    parking = cfg.get('parking', {})
+    if parking:
+        require(type(parking.get('commissioned')) is bool, 'parking.commissioned must be boolean')
+    if parking.get('commissioned'):
+        require(odom_configured(cfg) and h['enabled'] and t['enabled'] and u['enabled']
+                and all(m['pi_verified'] for m in h['motors'])
+                and cfg['lidar']['mount_verified'] and cfg['slam']['enabled'], 'automatic driving calibration incomplete')
+        for key in ('drawbar_m','car_front_m','car_back_m','car_width_m','trailer_front_m','trailer_back_m',
+                    'trailer_width_m','max_beta_rad','max_speed_m_s','max_accel_m_s2','clearance_m','sonar_stop_m',
+                    'encoder_proof_age_s','max_xy_variance','max_yaw_variance','pos_tol_m','yaw_tol_rad','stop_speed_m_s','deviation_m'):
+            require(number(parking.get(key),key)>0, f'{key}: positive measurement or limit required')
+        number(parking.get('hitch_back_m'),'hitch_back_m',0)
+        require(parking['max_beta_rad'] < math.pi/2 and parking['stop_speed_m_s'] < parking['max_speed_m_s'])
     return cfg
 
 
@@ -176,7 +189,7 @@ class PI:
             if now - self.zero_since < deadtime:
                 return 0.0
         self.last_sign, self.zero_since = sign, None
-        error = target - measured
+        error = 0.0 if open_loop else target - number(measured,'measured RPM')
         desired = target if open_loop else self.kp * error + self.integral + self.ki * error * dt
         # Avoid active reverse braking from a PI overspeed error.
         desired = max(0.0, desired) if sign > 0 else min(0.0, desired)
@@ -216,8 +229,10 @@ def integrate(x, y, yaw, distance, steering, wheelbase):
 
 
 class CommandManager:
-    """Only accepted, fresh owner commands renew the motor lease. AUTO is deliberately locked."""
+    """Only accepted, fresh owner drive commands renew the motor lease."""
     def __init__(self, cfg):
+        from .parking_control import Parking
+        self.parking = Parking()
         self.cfg, self.owner = cfg, None
         self.estop, self.armed, self.mode, self.control = True, False, 'MANUAL', 'OPEN_LOOP'
         self.target = None
@@ -233,10 +248,13 @@ class CommandManager:
 
     def handle(self, cmd, now, feedback):
         kind, session = cmd['type'], cmd['session']
+        if kind not in ('estop', 'stop'):
+            number(cmd['received'], 'received', now - self.cfg['network']['max_command_age_s'], now + 0.01)
+        if self.parking.handle(self, cmd, now, feedback):
+            return
         if kind in ('estop', 'stop'):
             self.stop(kind, kind == 'estop')
             return
-        number(cmd['received'], 'received', now - self.cfg['network']['max_command_age_s'], now + 0.01)
         if kind == 'claim':
             if self.owner not in (None, session):
                 raise ValueError('another client owns control')
@@ -251,7 +269,7 @@ class CommandManager:
         elif kind == 'mode':
             self.stop('mode_change')
             if cmd['mode'] != 'MANUAL':
-                raise ValueError('AUTO_PARK unavailable: algorithm and feedback qualification not implemented')
+                raise ValueError('unknown mode')
             self.mode = 'MANUAL'
         elif kind == 'control':
             self.stop('control_change')
@@ -299,14 +317,16 @@ class CommandManager:
             raise ValueError('unknown command')
 
     def tick(self, now, feedback):
+        self.parking.watch(self, now, feedback)
         if self.armed and (now > self.deadline or feedback is None):
             self.stop('command_or_feedback_timeout')
         if self.armed and feedback and feedback.get('fault'):
             # A prior controller latch can be cleared only by a NEW arm epoch.
             if feedback.get('epoch', -1) >= self.epoch:
                 self.stop('controller_fault', True)
+        parking = self.parking.status(self, now, feedback)
         return {'mode': self.mode, 'control': self.control, 'owner': self.owner,
                 'estop': self.estop, 'armed': self.armed, 'reason': self.reason,
                 'epoch': self.epoch, 'deadline': self.deadline, 'issued': now,
                 'limits': self.limits, 'target': self.target if self.armed else None,
-                'auto_available': False}
+                'parking': parking, 'auto_available': parking['online'] and parking['phase']=='planned' and parking['blocked'] is None}

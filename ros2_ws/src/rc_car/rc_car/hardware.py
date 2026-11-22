@@ -235,7 +235,8 @@ class Hardware:
                     if t['index_angle_rad'] is not None:
                         self.zero_count, self.zero_angle = self.index_pending, t['index_angle_rad']
                     self.index_pending = None
-                trailer.update(count=q.count, invalid=q.invalid, zeroed=self.zero_count is not None)
+                trailer.update(count=q.count, invalid=q.invalid, zeroed=self.zero_count is not None,
+                               sampled_at=now, last_edge_at=q.last_edge)
                 if self.zero_count is not None and not q.invalid:
                     angle = (q.count - self.zero_count) * 2 * math.pi / (4 * t['ppr']) + self.zero_angle + t['offset_rad']
                     trailer['angle_rad'] = math.atan2(math.sin(angle), math.cos(angle))

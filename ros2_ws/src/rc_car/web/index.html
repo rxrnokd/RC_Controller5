@@ -6,10 +6,10 @@
 <div class="map-wrap"><canvas id="map"></canvas><div id="mapEmpty">수신한 지도가 없습니다.<br><small>엔코더 · 조향 보정 · TF가 준비되어야 지도 생성이 가능합니다.</small></div></div>
 <div class="map-footer"><span id="pose">위치 데이터 없음</span><span>화살표: 차량 · 회색: 미탐색</span></div>
 <div class="save"><input id="mapName" placeholder="지도 이름 (영문/숫자)" maxlength="64"><button id="save">지도 + Pose graph 저장</button><span id="mapAge">—</span></div>
-<p class="note">지도는 마지막 수신 자료입니다. SLAM 상태가 준비되지 않으면 차량 위치를 숨깁니다. 조향은 명령 기반 추정값이며 실제 각도 센서는 없습니다.</p></section>
+<p class="note">지도는 마지막 수신 자료입니다. 스캔 매칭 위치만 있으면 계획 전용으로 표시합니다. 보라색 선은 MT6701 연결각과 실측 치수로 계산한 트레일러 자세입니다.</p></section>
 <aside><section class="card"><div class="row"><h2>제어권</h2><span id="mode" class="badge">MANUAL</span></div><p id="owner">관찰 모드</p>
 <div class="buttons"><button id="claim">제어권 획득</button><button id="release">반납</button><button id="arm">정지 해제 / 활성화</button><button id="stop">정지</button></div>
-<div class="row"><label>제어 방식 <select id="control"><option value="OPEN_LOOP">Open-loop PWM</option><option value="PI">PI · 엔코더 RPM</option></select></label><button disabled title="알고리즘 미구현">AUTO_PARK 잠김</button></div>
+<div class="row"><label>제어 방식 <select id="control"><option value="OPEN_LOOP">Open-loop PWM</option><option value="PI">PI · 엔코더 RPM</option></select></label></div>
 <p id="reason" class="note">시작 시 출력 차단</p><div class="keys"><kbd>W / ↑</kbd><kbd>A / ←</kbd><kbd>S / ↓</kbd><kbd>D / →</kbd></div>
 <p class="note">키를 누르는 동안만 주행합니다. 키 해제 시 모터 정지. 탭 전환·포커스 상실 시 비활성화. 입력칸에서는 키보드 조종이 차단됩니다.</p></section>
 <section class="card"><h2>출력 및 목표</h2><label>주행 목표 <span id="driveValue">0%</span><input id="drive" type="range" min="0" max="100" value="0"></label>
@@ -21,4 +21,9 @@
 <div class="sensor-grid"><div><h3>모터 1 · LEFT</h3><dl id="motor0"></dl></div><div><h3>모터 2 · RIGHT</h3><dl id="motor1"></dl></div>
 <div><h3>트레일러 · MT6701</h3><strong id="trailer">—</strong><p id="trailerStatus">영점 미설정</p><button id="zero">현재 자세를 영점으로</button><h3>조향 서보</h3><p id="servo">—</p></div>
 <div><h3>초음파 · US-100</h3><dl id="ranges"></dl></div></div><p id="fault" class="error"></p></section>
-<section class="card log"><h2>명령 결과</h2><pre id="events">연결 중…</pre></section></main><footer>로컬 네트워크 전용 · 실차 검증 전 · AUTO_PARK 알고리즘 없음</footer></body></html>
+<section class="card telemetry"><h2>트레일러 후진 주차</h2>
+<p>지도에서 트레일러 차축 목표 지점을 누르고 최종 앞 방향으로 드래그하세요. 주황 선은 Hybrid A*, 하늘색 선은 MPC의 트레일러 경로입니다.</p>
+<label>최종 연결각 (차량 방향 − 트레일러 방향, 도) <input id="goalBeta" type="number" step="1" value="0"></label>
+<p id="goalText">목표 미지정</p><p id="parkStatus">노트북 연결 대기</p>
+<div class="buttons"><button id="plan">경로 계획 / 재계획</button><button id="clearParkStop">비상정지 해제 (정지 유지)</button><button id="startPark" disabled>AUTO_PARK 시작</button><button id="cancelPark">주차 중지 · 수동 복귀</button></div></section>
+<section class="card log"><h2>명령 결과</h2><pre id="events">연결 중…</pre></section></main><footer>로컬 네트워크 전용 · 실차 검증 전</footer></body></html>

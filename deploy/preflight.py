@@ -18,7 +18,7 @@ def main():
     paths = [f"/dev/gpiochip{cfg['hardware']['gpiochip']}", cfg['servo']['pwmchip'], cfg['lidar']['serial_port'], cfg['slam']['params_file']]
     for path in paths:
         print(f'{path}: exists={Path(path).exists()}, read={os.access(path, os.R_OK)}, write={os.access(path, os.W_OK)}')
-    print('AUTO_PARK: locked in code. No algorithm is installed.')
+    print('AUTO_PARK commissioning:', 'configured; live feedback and operator required' if cfg.get('parking', {}).get('commissioned') else 'locked; laptop planning only')
     print('This check does NOT verify pinmux, encoder electrical levels, timing, motor direction, or SLAM.')
 
 

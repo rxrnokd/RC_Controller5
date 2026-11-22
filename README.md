@@ -1,6 +1,6 @@
 # Raspberry Pi 4 RC 차량 · ROS 2 Jazzy
 
-기존 `~/rc_lidar_docker`에 추가하는 초기 구현이다. **실차 구동 검증을 마친 시스템이 아니다.** Windows에서 코드·계산·안전 상태 전이를 검사했으며, GPIO 타이밍·전류·조향·엔코더·Docker/Jazzy 통합·SLAM 지도 품질은 Raspberry Pi에서 검증해야 한다. 센서 시뮬레이터와 자동주차 알고리즘은 포함하지 않는다.
+기존 `~/rc_lidar_docker`에 추가하는 초기 구현이다. Raspberry Pi가 차량 제어와 SLAM을 담당하고, 노트북 Python 프로세스가 트레일러 후진 주차 경로와 속도·조향 명령을 계산한다. **현재 DC 모터 엔코더 피드백 불량으로 실제 자동주차는 잠겨 있다.** Windows에서 수행한 수학·제어권 테스트와 Pi에서 필요한 검증은 아래에 구분했다.
 
 기본 설정은 모터/서보/센서/라이다/SLAM 비활성, 최대 PWM 0, 비상정지 래치 상태다. 설정을 채우기 전에도 기존 ROS 환경에서 웹 서버와 상태 노드를 실행할 수 있다. 없는 측정값은 JSON `null`, UI `—`로 표시한다. 임의의 지도·RPM·거리·차량 위치를 만들지 않는다.
 
@@ -28,8 +28,8 @@
 ## 2. 구조와 파일
 
 ```text
-노트북 브라우저 / 향후 Python 알고리즘
-        │ HTTP :8080 + 단일 WebSocket /ws
+노트북 브라우저 + 별도로 실행하는 노트북 Python 주차 알고리즘
+        │ 각 클라이언트에서 같은 Pi 포트로 WebSocket 한 개씩 /ws
         ▼
 Docker web_bridge ── /rc/request ──► command_manager
         ▲                             │ /rc/command
@@ -57,7 +57,9 @@ TF: map ──SLAM──► odom ──엔코더 운동학──► base_link �
 | `.../web.py`, `.../web/*` | ROS↔단일 WebSocket, 지도 저장, 웹 UI |
 | `.../launch/vehicle.launch.py` | 기존 C1/SLAM launch 통합 |
 | `deploy/*` | 기존 이미지 확장, 점검, 실행 |
-| `laptop/client.py` | 향후 알고리즘용 비동기 클라이언트. 직접 실행하면 관찰만 수행 |
+| `laptop/client.py` | 웹과 같은 프로토콜을 쓰는 비동기 클라이언트. 직접 실행하면 관찰만 수행 |
+| `laptop/parking/` | 노트북 전용. planner.py는 운동학·충돌·Hybrid A*, mpc.py는 계획·추종 MPC, __main__.py는 저장 지도 및 실시간 실행 |
+| `.../parking_control.py` | Pi Command Manager의 주차 제어권·피드백·정지 검사 |
 | `tests/*` | 하드웨어 독립 회귀 테스트. 센서 시뮬레이터가 아님 |
 
 ## 3. GPIO, 전원, Docker 접근
@@ -129,12 +131,19 @@ Docker는 호스트 커널과 GPIO 장치를 공유한다. GPIO edge/PWM에는 �
 
 ```powershell
 $PiTarget = '사용자명@라즈베리파이IP'
-scp -r deploy config laptop tests "${PiTarget}:~/rc_lidar_docker/"
+scp -r deploy "${PiTarget}:~/rc_lidar_docker/"
 scp -r ros2_ws/src/rc_car "${PiTarget}:~/rc_lidar_docker/ros2_ws/src/"
+scp config/vehicle.yaml "${PiTarget}:/tmp/rc-vehicle-template.yaml"
 scp README.md "${PiTarget}:~/rc_lidar_docker/README.md"
 ```
 
-새 `config` 폴더에는 `vehicle.yaml`만 있으므로 기존 `slam.yaml`을 대체하지 않는다. 기존 README가 필요하면 전송 전 별도 보관한다. 원본 첨부자료는 코드 실행에 필요하지 않다.
+Pi OS에서 기존 보정 파일의 유무에 따라 설정을 반영한다. 처음 설치하면 아래 명령이 기본 설정을 복사한다. 이미 사용 중인 파일이 있으면 실측값을 보존하고 편집기로 템플릿의 새 `parking:` 절만 기존 `config/vehicle.yaml`에 추가한다. 기존 `slam.yaml`은 그대로 사용한다. Python 주차 코드는 노트북에서 실행하므로 노트북 프로젝트 폴더에 둔다.
+
+```bash
+cd ~/rc_lidar_docker
+mkdir -p config
+test -e config/vehicle.yaml || cp /tmp/rc-vehicle-template.yaml config/vehicle.yaml
+```
 
 Windows에서 가능한 점검:
 
@@ -145,7 +154,7 @@ python deploy/preflight.py config/vehicle.yaml
 node --check ros2_ws/src/rc_car/web/app.js
 ```
 
-Python에 PyYAML이 필요하다. 이 점검은 ROS 실행 및 하드웨어 테스트가 아니다. Windows/macOS 브라우저 사용자에게 Python이나 ROS 설치는 필요 없다.
+기본 테스트에는 PyYAML이 필요하다. 노트북 경로 계산 테스트에는 아래 7절의 수치 라이브러리도 설치한다. Windows/macOS에서 웹 수동 조종만 사용할 때는 브라우저로 접속하면 된다.
 
 ### Raspberry Pi OS: 이미지 확인과 추가 의존성
 
@@ -323,7 +332,7 @@ ros2 service list | grep slam_toolbox
 | 비상정지 또는 stop | 관찰자를 포함한 모든 연결에서 정지 가능 |
 | 모드/PI-Open-loop/제한 변경 | 정지·비활성화 후 별도 활성화 필요 |
 | 키 해제 | 주행 목표 0, 모터 즉시 브레이크 |
-| 탭 숨김/창 blur/입력칸 포커스 | stop 요청. 추가로 차량 측 timeout 적용 |
+| 수동 조종 탭 숨김/창 blur/입력칸 포커스 | 활성화된 수동 조종자가 stop 요청. 추가로 차량 측 timeout 적용 |
 | WebSocket 종료 | owner release. 전달 실패 시 watchdog |
 | 마지막 정상 drive 이후 기본 0.30초 | manager 정지·비활성화. heartbeat만으로 연장되지 않음 |
 | manager 정지/명령 만료 | controller에서도 독립 확인 후 출력 차단 |
@@ -331,7 +340,7 @@ ros2 service list | grep slam_toolbox
 | 센서 준비/출력 초기화 실패 | 활성화 차단, fault 출력 |
 | PI에서 엔코더 손실 | 두 모터 정지/래치. 자동 Open-loop 전환 없음 |
 | Open-loop에서 엔코더 없음 | 명시적으로 선택한 수동 PWM은 허용. RPM/Odometry 유효성은 별도 처리 |
-| AUTO_PARK 요청 | 항상 거부하며 정지. 설정 파일로 해제할 스위치도 없음 |
+| AUTO_PARK 요청 | 정지 상태, 실차 검증 설정, 실제 센서·위치, 동일 지도·시작 자세, 노트북의 완성된 계획 확인 후 PI 제어권 이양 |
 
 기본 `command_timeout_s=0.30`은 **차량이 마지막으로 수락한 명령 이후** 기준이다. 클라이언트는 최신 server_time을 되돌려 보내고 오래된 명령은 거부된다. 네트워크 지연, 명령 허용 나이, loop 주기, finite PWM 잔여 시간이 더해질 수 있으며 실제 최악 정지시간은 계측해야 한다. 운영체제/커널 전체 정지, 전원 장애, 드라이버 고장까지 소프트웨어가 보장하지 않는다. 물리적 비상정지는 독립적으로 필요하다.
 
@@ -347,6 +356,7 @@ ros2 service list | grep slam_toolbox
 | `/rc/ack` | std_msgs/String JSON; 명령 수락/거부/동작 결과 |
 | `/rc/action` | 내부 영점 동작 요청 |
 | `/rc/odom_status` | std_msgs/String JSON; Odometry 유효성/사유 |
+| `/rc/localization_health`, `/rc/parking_paths` | web_bridge → manager의 위치 품질·지도 버전, manager → web_bridge의 작업별 경로 |
 | `/odom`, `/tf`, `/tf_static` | nav_msgs/Odometry 및 표준 TF |
 | `/scan` | 기존 드라이버의 sensor_msgs/LaserScan |
 | `/map` | SLAM Toolbox의 nav_msgs/OccupancyGrid |
@@ -379,21 +389,56 @@ WebSocket: `ws://Pi주소:8080/ws`, JSON 텍스트, 버전 `v=1`. 한 연결로 
 
 PI drive는 `speed_m_s` 또는 모터별 출력축 `rpm:[left,right]`를 받는다. 속도 명령은 휠베이스/윤거를 사용해 좌우 목표를 나눈다. 클램프 시 좌우 비율을 유지한다. Open-loop는 `pwm:[left,right]`이며 signed duty다. 두 방식 모두 `steering_rad`와 공통 manager/controller를 사용한다. UI는 RPM 목표를 모터별 제한×주행 목표 비율로 생성한다. 배열과 숫자는 길이·유한성 검사하며 NaN/Infinity/문자열 숫자/범위 위반은 거부한다.
 
-기타 명령은 `estop`, `mode` (`MANUAL`만 허용), `zero_trailer`, `save_map` (`name`)이다. `arm`은 신선한 준비 상태 및 영출력에서 비상정지를 해제하고 새로운 epoch를 만든다. ACK는 `{type:"ack",seq,ok,error?}`이며 drive ACK는 **목표 수락**일 뿐 실제 속도 도달을 의미하지 않는다. 영점/지도 저장 ACK는 해당 동작 결과를 의미한다.
+기타 명령은 `estop`, `mode`, `zero_trailer`, `save_map` (`name`)이다. 수동 `arm`은 신선한 준비 상태 및 영출력에서 비상정지를 해제하고 새로운 epoch를 만든다. 주차 제어권 이양에는 아래의 별도 정지 상태 절차가 필요하다. ACK는 `{type:"ack",seq,ok,error?}`이며 drive ACK는 목표 수락을 표시한다.
 
 `state`에는 `server_time`, `data.vehicle`, `data.command`, `data.odom`, `data.scan`, `data.odometry_status`, 각 `age_s`, `map_pose`, `slam_ready`가 있다. `map_pose`는 map 좌표계, `data.odom`은 odom 좌표계다. `map` 메시지는 width/height/resolution/origin[x,y,yaw]/data를 갖는다. data는 ROS와 같은 `row=y, column=x` 순서의 -1/0..100 배열이다. UI는 이미지의 Y축 반전과 지도 origin yaw를 반영한다. 지도 최대 크기와 전송 주기는 config에서 제한하며 느린 클라이언트는 연결을 닫아 제어권을 반납한다.
 
-### 향후 노트북 자동주차
+### 노트북에서 트레일러 주차 사용하기
 
-`laptop/client.py`는 `aiohttp` 기반 transport만 구현했다. 직접 실행하면 센서를 관찰하며 제어권을 획득하거나 주행하지 않는다.
+**수동 조종은 브라우저만 열면 된다.** 자동주차 화면을 사용할 때는 노트북 터미널에서 Python 프로그램을 먼저 실행하고 그대로 둔다. 브라우저 버튼은 Pi에 계획이나 시작을 요청한다. Pi가 요청을 이미 연결된 노트북 프로그램에 전달한다. ROS, GPIO, SLAM Toolbox는 계속 Pi Docker에서 실행된다.
 
-```bash
-# Windows/macOS 노트북: 향후 Python 알고리즘 개발자만 필요
-python -m pip install aiohttp
-python laptop/client.py http://라즈베리파이IP:8080
+1. **실측 설정.** `config/vehicle.yaml`의 `geometry.wheelbase_m`, `servo.max_angle_rad`, `servo.slew_rad_s`를 확인한다. `parking`에는 뒷차축에서 히치까지의 후방 거리, 히치에서 트레일러 차축까지의 거리, 양 차체의 차축 기준 앞·뒤 돌출량 및 전체 폭을 m로 입력한다. 이 버전은 양 차축과 히치가 각각 차체 중심선에 있는 단일 트레일러를 대상으로 한다. 차량 `base_link` 원점은 뒤 차축 중심이어야 한다. MT6701의 부호는 **차량 yaw − 트레일러 yaw**이며 직진 영점과 좌우 회전을 실측한다.
+2. **운영 한계.** 접힘·차체 간섭 전에 정지할 연결각, 허용 속도와 가속도, 위치 오차와 제동거리를 고려한 여유 거리·초음파 정지 거리, 허용 위치 분산·각도 분산, 출발 전 각 바퀴의 실제 에지를 얼마나 최근까지 인정할지 설정한다. `pos_tol_m`, `yaw_tol_rad`, `stop_speed_m_s`, `deviation_m`은 판정 기준이다. 실시간 계획에서는 Pi가 해당 설정을 노트북으로 보낸다. **현재는 `parking.commissioned: false`를 유지한다.**
+3. **노트북 설치.** 프로젝트 루트에서 Python 3.10 이상으로 다음을 실행한다. macOS에서 실행 파일 이름이 `python3`이면 아래 명령의 `python`을 `python3`로 바꾼다. Pi 이미지에 이 수치 라이브러리를 설치할 필요는 없다.
+
+```text
+python -m pip install numpy scipy PyYAML Pillow aiohttp
+python -m laptop.parking --help
 ```
 
-지도, map pose/yaw, 속도, 모터 RPM/거리, 트레일러 각도, 초음파와 차량 상태를 동일 연결로 사용할 수 있다. `VehicleClient.drive(speed_m_s, steering_rad)`는 공통 PI 명령 형식이다. **AUTO_PARK는 코드에서 잠겨 있으며 현재 클라이언트로도 활성화할 수 없다.** 나중에 알고리즘 구현 후 필수 엔코더·신선한 map localization·조향·영점 설정된 트레일러 피드백, 알고리즘 heartbeat, 모드 전환 정지 및 피드백 상실 래치 정책을 manager에 추가하고 회귀/실차 검증한 다음 해제해야 한다. 지금 AUTO 상태에서 Open-loop로 전환하는 경로는 존재하지 않는다.
+#### A. 엔코더 수리 전, 저장한 지도에서 경로만 계산
+
+실제 저장한 Nav2 trinary 지도 YAML과 같은 폴더의 회색조 PGM 또는 기존 WebSocket `map` JSON을 노트북에 둔다. 아래는 명령 형식이다. 파일 경로와 대문자 인자는 측정한 값으로 바꾼다. `--start`는 차량 뒤 차축 중심과 차량 yaw, 연결각이다. `--goal`은 **트레일러 차축 중심**과 트레일러의 최종 앞 방향, 최종 연결각이다. 좌표는 map 기준 m, 각도는 rad이다.
+
+```text
+python -m laptop.parking offline --map maps/garage.yaml --start CAR_X CAR_Y CAR_YAW BETA --goal TRAILER_X TRAILER_Y TRAILER_YAW FINAL_BETA --initial-steer STEER_RAD --out parking-plan.json
+```
+
+이 명령은 Pi에 연결하지 않는다. 입력한 자세는 계획 조건으로만 사용한다. 출력 JSON의 `hybrid` 각 항목은 `[[x,y,yaw,beta], 부호있는_구간거리_m, 조향_rad]`, `reference`는 `[시간_s,[x,y,yaw,beta],속도_m_s,조향_rad]`이다. 충돌, 미설정 치수, 탐색 예산 초과 시 오류를 반환한다.
+
+#### B. 웹 지도에서 계획 요청
+
+Pi에 이 버전의 ROS 패키지·웹 파일·차량 설정을 반영하고 기존 배포 절차로 컨테이너를 실행한다. 아래 예시의 IP를 실제 Pi 주소로 바꾼다.
+
+```text
+python -m laptop.parking connect http://192.168.1.42:8080
+```
+
+같은 주소를 노트북 브라우저에서 열고 **제어권 획득 → 정지 → 지도에서 목표 지점을 누르고 트레일러 앞 방향으로 드래그 → 최종 연결각 입력 → 경로 계획** 순서로 사용한다. 비상정지를 해제하지 않아도 계획할 수 있다. 주황색은 Hybrid A*, 하늘색은 Planning MPC의 트레일러 차축 경로다. 보라색은 현재 차량에서 트레일러 차축까지의 연결을 나타낸다. 수신한 지도와 MT6701 영점·유효각, 최근 map 자세가 필요하다. 유효한 Odometry가 없어도 최근 SLAM 스캔 매칭 자세가 실제로 수신되면 계획을 허용한다. 이때 서보 명령도 없으면 계획의 첫 조향만 중앙으로 가정한다. 화면에 가정한 값을 계측값으로 발행하지 않는다. 지도만 남고 현재 자세가 없으면 A 절차를 사용한다.
+
+#### C. 실차 검증 후 추종
+
+9절의 실측 기록을 완료하고 승인한 설정에서만 관리자가 `commissioned`를 설정한다. 운영자는 정지한 차량에서 계획을 확인하고 **비상정지 해제 (정지 유지) → AUTO_PARK 시작**을 누른다. 양쪽 엔코더의 최근 실제 회전 이력과 정지 속도, PI·조향 상태, 영점이 잡힌 MT6701, 초음파 4개, 신선한 `/scan`·`/odom`·지도 TF와 허용 분산 내 `/pose`가 모두 필요하다. `/pose`가 설치한 SLAM 구성에서 발행되는지, 정지·저속에서도 주차에 필요한 빈도로 갱신되는지 확인한다. 서보 상태에는 보정된 **명령각**을 사용한다. 실제 조향 응답과 명령각 오차를 실측해야 한다. SLAM Toolbox는 처리한 스캔의 시각과 공분산을 자세 메시지에 기록한다. [SLAM Toolbox의 자세 발행 코드](https://github.com/SteveMacenski/slam_toolbox/blob/ros2/src/slam_toolbox_common.cpp)
+
+주행 중 목표 속도(m/s)·조향각(rad)은 노트북만 보내고, 두 모터의 PI와 서보는 공통 차량 제어기가 수행한다. 지도 내용 변경, 이탈, 연결각 초과, 초음파 접근·만료, 엔코더/위치 손실, 노트북·운영 브라우저 연결 종료 시 정지한다. 새로 제어권을 획득하고 현재 지도에서 다시 계획한다. **주차 중지**와 **비상정지**는 브라우저에서 즉시 요청할 수 있다.
+
+| 단계 | 노트북 계산 |
+|---|---|
+| Trailer-aware Hybrid A* | 차량 뒤 차축의 자전거 모델과 오프축 히치의 트레일러 각속도를 부호 있는 거리로 적분한다. 후진 우선, 전진 보정·기어 전환 비용, 최종 후진 진입을 적용한다. 차량·연결부·트레일러 직사각형을 덮는 원들과 점유 격자 거리장을 사용해 이동 구간을 세분 검사한다. 미탐색·지도 밖은 장애물로 취급한다. |
+| Planning MPC | 최대 5개 구간의 조향 후보를 반복 평가해 차체·트레일러 자세 오차, 조향 변화, 장애물 거리로 기준을 선택한다. 최종 자세를 벗어나면 검증된 원 경로를 사용한다. 조향·기어 변경 때 정차하도록 가감속 제한을 적용해 시간 기준 궤적을 만든다. |
+| Tracking MPC | 최신 차량 자세·양쪽 바퀴 평균 속도·연결각·보정 조향 명령으로 5단계 속도·조향 후보를 예측하고 첫 명령만 적용한다. 이탈하거나 후보가 없으면 정지한다. 목표에서 양 차체의 위치·방향 허용 오차, 실측 정지 속도와 영출력을 확인해 완료한다. |
+
+웹과 Python은 같은 `/ws`에 각각 한 번 연결한다. Python의 `park_register`·`park_ping`은 연결 상태만 갱신한다. 브라우저의 `park_plan`은 지도 버전·목표를 보내고, 노트북의 `park_result`는 작업 ID·시작 자세·두 경로를 돌려준다. Pi가 `parking_paths`와 `state.data.command.parking`을 브라우저로 전달한다. 자동 모드에서는 등록된 노트북의 현재 작업 ID가 있는 PI `drive`만 구동 명령으로 인정한다. `park_complete`, `park_abort`, 공통 `stop`·`estop`이 작업을 끝낸다. 재접속 후 자동 재출발하지 않는다.
 
 ## 8. 전원 재공급 후 운영
 
@@ -425,6 +470,9 @@ docker logs --tail 100 rc-car
 - [ ] `/odom`, TF 직진/원호/후진 검증, 센서 유실 시 TF 발행 중단 및 재시작 필요 상태 확인
 - [ ] 실제 지도 생성/차량 방향 표시/지도 저장/동일 시작 자세 localization 재사용
 - [ ] 전원 재공급 후 비상정지 및 자동 미출력 확인
+- [ ] 주차용 치수·연결각 부호·전후진 궤적을 실제 기록과 비교하고 차량/트레일러/히치의 여유 거리 및 간섭 한계 측정
+- [ ] 실측 지도와 시작 자세로 경로 검토, 기록된 센서로 추종 오차·연산 시간 확인, 계측한 저속 정지거리로 초음파 한계·속도 상한 결정
+- [ ] 모터 전력을 차단한 통합 시험에서 Wi-Fi 단절·운영자 종료·지도 갱신·접힘·피드백 손실 시 정지와 재출발 차단 확인
 
 검증 기록은 이 README 아래에 날짜·설정값·계측 결과를 추가하면 된다. 확인하지 않은 항목을 체크하지 않는다.
 
@@ -458,7 +506,7 @@ Docker가 하드웨어 타이밍을 실시간으로 보장하지 않는다. 커�
 
 - 제공 TXT 2개, PDF 4개 전체 텍스트, PNG 2개를 분석했다. MDD3A의 사양/진리표는 Windows PDF 렌더링으로 시각 확인했다.
 - Python 파일 컴파일, JavaScript 구문 검사, Bash 구문 검사를 수행했다.
-- `unittest` 33개 통과: 제어권, 시작 비상정지, stale/timeout, AUTO 차단, 제한값, PI 피드백/anti-windup/역전, 운동학/수치 overflow, motor/trailer 분리, 유한 PWM 호출 계약을 검사했다.
+- 기존 제어 테스트와 주차 수학·통합 단위 테스트를 Windows에서 실행했다. 주차 테스트는 시험용 격자·자세로 후진·연결각·충돌·속도/조향 한계·목표 판정·작업별 제어권·피드백 유실·오프라인 CLI를 검사한다. 실제 주행 기록과 저장 지도는 이번 작업 폴더에 없어 실측 궤적 재검증은 남아 있다.
 - preflight는 기본 설정 출력 차단을 확인했다. 현재 Windows에는 rclpy/lgpio/aiohttp와 Pi 장치가 없으므로 ROS/WebSocket 실제 서버 및 실차 통합 테스트를 실행하지 못했다.
 - 브라우저 접근 호스트가 제공되지 않아 실제 브라우저 렌더링/키보드 E2E 검증도 미실행이다. 웹 UI가 동작 검증 완료라고 표시하지 않는다.
 

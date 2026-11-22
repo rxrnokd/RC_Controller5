@@ -3,9 +3,11 @@ const $ = id => document.getElementById(id);
 const fmt = (x, d=2) => typeof x === 'number' && Number.isFinite(x) ? x.toFixed(d) : '—';
 let ws, sequence=0, serverTime=null, state=null, session=null, lastState=0, grid=null, gridCanvas=null;
 const keys=new Set();
+let parkingPaths=null, parkingGeometry={}, goal=null, dragStart=null;
 function log(message){$('events').textContent=(new Date().toLocaleTimeString()+' '+message+'\n'+$('events').textContent).slice(0,4000);}
 function send(type, extra={}){if(ws?.readyState===WebSocket.OPEN)ws.send(JSON.stringify({v:1,seq:++sequence,type,server_time:serverTime,...extra}));}
 function stop(){keys.clear();send('stop');}
+function stopManual(){keys.clear();const c=state?.data.command;if(c?.owner===session&&c.mode==='MANUAL'&&c.armed)send('stop');}
 function limits(){return {pwm:+$('pwm').value,rpm:[+$('rpm1').value,+$('rpm2').value],steering:+$('steer').value};}
 function labels(){const l=limits();$('driveValue').textContent=$('drive').value+'%';$('pwmValue').textContent=fmt(l.pwm*100,0)+'%';$('rpm1Value').textContent=fmt(l.rpm[0],1);$('rpm2Value').textContent=fmt(l.rpm[1],1);$('steerValue').textContent=fmt(l.steering)+' rad';}
 function connection(text, good=false){$('connection').textContent=text;$('connection').className='badge '+(good?'ok':'warn');}
@@ -18,10 +20,15 @@ function connect(){
     const msg=JSON.parse(event.data);
     if(msg.type==='hello'){
       session=msg.session;
+      parkingGeometry=msg.parking_config?.parking||{};
+      grid=null;gridCanvas=null;goal=null;parkingPaths=null;$('mapEmpty').hidden=false;
+      $('goalText').textContent='목표 미지정';
       for(const [id,value] of [['pwm',msg.limits.pwm],['rpm1',msg.limits.rpm[0]],['rpm2',msg.limits.rpm[1]],['steer',msg.limits.steering]]){$(id).max=value;$(id).value=value;}
       labels();log('접속 완료. 제어권 획득 후 활성화하십시오.');
     } else if(msg.type==='state'){
       state=msg;serverTime=msg.server_time;lastState=performance.now();connection('WebSocket 연결',true);render();
+    } else if(msg.type==='parking_paths'){
+      parkingPaths=msg;drawMap();
     } else if(msg.type==='ack'){
       log(msg.ok?`명령 ${msg.seq} 완료${msg.saved?' · '+msg.saved.join(', '):''}`:`거부: ${msg.error}`);
     } else if(msg.type==='map'){
@@ -40,6 +47,16 @@ function render(){
   const fresh=state&&performance.now()-lastState<600&&(state.age_s.vehicle??999)<0.6;
   const commandFresh=state&&(state.age_s.command??999)<0.5;
   $('mode').textContent=command.mode||'MANUAL';
+  const parking=command.parking||{};
+  const phase={idle:'대기',planning:'경로 계산 중',planned:'경로 준비됨',tracking:'경로 추종 중',stopped:'정지',failed:'실패',complete:'주차 완료'};
+  $('parkStatus').textContent=[parking.online?'노트북 연결됨':'노트북 오프라인',phase[parking.phase],
+    fresh&&vehicle.motors?.filter(m=>m.feedback_valid).length!==2?'양쪽 엔코더 속도 확인 필요':'',
+    parking.detail,parking.blocked,parking.error_m!=null?'트레일러 추종 오차 '+fmt(parking.error_m)+' m':''].filter(Boolean).join(' · ');
+  const owner=fresh&&commandFresh&&session&&command.owner===session;
+  $('plan').disabled=!(owner&&parking.online&&goal&&grid&&goal.version===grid.version&&!command.armed);
+  $('clearParkStop').disabled=!(owner&&command.estop&&!command.armed);
+  $('startPark').disabled=!(owner&&command.auto_available&&!command.estop&&!command.armed&&parking.job&&parking.job.map_version===grid?.version
+    &&goal&&JSON.stringify(parking.job.goal)===JSON.stringify([...goal.pose,Number($('goalBeta').value)*Math.PI/180]));
   if(command.control&&document.activeElement!==$('control'))$('control').value=command.control;
   $('owner').textContent=command.owner===session&&session?'이 브라우저에 제어권 있음':command.owner?'다른 클라이언트가 제어 중':'관찰 모드 · 제어권 없음';
   $('reason').textContent=`${commandFresh?(command.armed?'활성화':'출력 차단'):'제어 상태 오래됨'} · ${command.reason||'상태 대기'}${command.estop?' · 비상정지 래치':''}`;
@@ -57,7 +74,10 @@ function render(){
   $('servo').textContent=`명령 ${fmt(servo?.command_rad)} rad · 펄스 ${fmt(servo?.pulse_us,0)} μs · 실제각 미측정`;
   $('ranges').replaceChildren(...[0,1,2,3].flatMap(i=>{const r=fresh?vehicle.ultrasonic?.[i]:null;const dt=document.createElement('dt'),dd=document.createElement('dd');dt.textContent='US-'+(i+1);dd.textContent=r?.status==='ok'?fmt(r.m*100,1)+' cm':r?.status||'—';return [dt,dd];}));
   const pose=fresh&&state?.slam_ready?state.map_pose:null;
-  $('pose').textContent=pose?`MAP · x ${fmt(pose.x)} m / y ${fmt(pose.y)} m / yaw ${fmt(pose.yaw)} rad`:'MAP 위치 데이터 없음';
+  const match=state?.data.scan_match;
+  const previewPose=match&&performance.now()-lastState<600&&state.ros_time_s-match.stamp_s>=0&&state.ros_time_s-match.stamp_s<0.5?match:null;
+  const shown=pose||previewPose;
+  $('pose').textContent=shown?`${pose?'MAP':'스캔 매칭 · 계획 전용'} · x ${fmt(shown.x)} m / y ${fmt(shown.y)} m / yaw ${fmt(shown.yaw)} rad`:'MAP 위치 데이터 없음';
   $('mapAge').textContent=grid?`지도 수신 ${fmt(state?.age_s.map,1)}초 전`:'';
   drawMap();
 }
@@ -66,14 +86,61 @@ function drawMap(){
   if(!gridCanvas)return;
   const scale=Math.min(canvas.width/grid.width,canvas.height/grid.height)*0.94, ox=(canvas.width-grid.width*scale)/2,oy=(canvas.height-grid.height*scale)/2;
   context.imageSmoothingEnabled=false;context.drawImage(gridCanvas,ox,oy,grid.width*scale,grid.height*scale);
-  const pose=performance.now()-lastState<600&&state?.slam_ready?state.map_pose:null;if(!pose)return;
-  const [gx,gy,ga]=grid.origin,dx=pose.x-gx,dy=pose.y-gy;
+  const [gx,gy,ga]=grid.origin;
+  function pixel(x,y){
+    const dx=x-gx,dy=y-gy;
+    return [ox+(Math.cos(ga)*dx+Math.sin(ga)*dy)*scale/grid.resolution,
+            oy+(grid.height-(-Math.sin(ga)*dx+Math.cos(ga)*dy)/grid.resolution)*scale];
+  }
+  function line(points,color,width){
+    context.beginPath();
+    points.forEach(([x,y],i)=>context[i?'lineTo':'moveTo'](...pixel(x,y)));
+    context.strokeStyle=color;context.lineWidth=width*devicePixelRatio;context.stroke();
+  }
+  const job=state?.data.command?.parking?.job;
+  if(parkingPaths&&job?.id===parkingPaths.job_id&&job.map_version===grid.version){
+    line(parkingPaths.hybrid,'#ffad49',5);line(parkingPaths.reference,'#43c6ff',2);
+  }
+  if(goal&&goal.version===grid.version){
+    const [x,y,a]=goal.pose;
+    line([[x,y],[x+Math.cos(a)*grid.resolution*12,y+Math.sin(a)*grid.resolution*12]],'#fd7bc8',3);
+    context.beginPath();context.arc(...pixel(x,y),4*devicePixelRatio,0,2*Math.PI);context.fillStyle='#fd7bc8';context.fill();
+  }
+  const match=state?.data.scan_match;
+  const pose=performance.now()-lastState<600?(state?.map_pose||(match&&state.ros_time_s-match.stamp_s>=0&&state.ros_time_s-match.stamp_s<0.5?match:null)):null;
+  if(!pose)return;
+  const t=state?.data.vehicle?.trailer,h=parkingGeometry.hitch_back_m,b=parkingGeometry.drawbar_m;
+  if(state.age_s.vehicle<0.3&&t?.zeroed&&!t.invalid&&Number.isFinite(t.angle_rad)&&Number.isFinite(h)&&Number.isFinite(b)){
+    const hitch=[pose.x-h*Math.cos(pose.yaw),pose.y-h*Math.sin(pose.yaw)],a=pose.yaw-t.angle_rad;
+    line([[pose.x,pose.y],hitch,[hitch[0]-b*Math.cos(a),hitch[1]-b*Math.sin(a)]],'#dda5ff',5);
+  }
+  const dx=pose.x-gx,dy=pose.y-gy;
   const px=(Math.cos(ga)*dx+Math.sin(ga)*dy)/grid.resolution,py=(-Math.sin(ga)*dx+Math.cos(ga)*dy)/grid.resolution;
   context.save();context.translate(ox+px*scale,oy+(grid.height-py)*scale);context.rotate(-(pose.yaw-ga));
   context.fillStyle='#19d6a0';context.strokeStyle='#102a30';context.lineWidth=2*devicePixelRatio;
   const r=12*devicePixelRatio;context.beginPath();context.moveTo(r,0);context.lineTo(-r*.7,-r*.65);context.lineTo(-r*.4,0);context.lineTo(-r*.7,r*.65);context.closePath();context.fill();context.stroke();context.restore();
 }
 $('estop').onclick=()=>{keys.clear();send('estop');};$('stop').onclick=stop;
+function mapPoint(event){
+  const box=$('map').getBoundingClientRect(),scale=Math.min(box.width/grid.width,box.height/grid.height)*.94;
+  const dx=((event.clientX-box.left-(box.width-grid.width*scale)/2)/scale)*grid.resolution;
+  const dy=(grid.height-(event.clientY-box.top-(box.height-grid.height*scale)/2)/scale)*grid.resolution;
+  const [x,y,a]=grid.origin;
+  return [x+dx*Math.cos(a)-dy*Math.sin(a),y+dx*Math.sin(a)+dy*Math.cos(a)];
+}
+$('map').onpointerdown=e=>{if(grid){dragStart={xy:mapPoint(e),version:grid.version};$('map').setPointerCapture(e.pointerId);}};
+$('map').onpointerup=e=>{
+  if(!grid||dragStart?.version!==grid.version)return;
+  const [x,y]=dragStart.xy,[ex,ey]=mapPoint(e);dragStart=null;
+  if(Math.hypot(ex-x,ey-y)<grid.resolution)return;
+  goal={version:grid.version,pose:[x,y,Math.atan2(ey-y,ex-x)]};
+  $('goalText').textContent='트레일러 차축 목표 '+goal.pose.map(v=>fmt(v)).join(' / ')+' (m, m, rad)';render();
+};
+$('plan').onclick=()=>{if(goal)send('park_plan',{goal:[...goal.pose,Number($('goalBeta').value)*Math.PI/180],map_version:goal.version});};
+$('clearParkStop').onclick=()=>send('park_reset');
+$('startPark').onclick=()=>{keys.clear();send('mode',{mode:'AUTO_PARK'});};
+$('cancelPark').onclick=stop;
+$('goalBeta').oninput=render;
 $('claim').onclick=()=>send('claim');$('release').onclick=()=>{keys.clear();send('release');};
 $('arm').onclick=()=>{keys.clear();send('arm');};
 $('control').onchange=()=>{keys.clear();send('control',{control:$('control').value});};
@@ -82,8 +149,8 @@ for(const id of ['drive','pwm','rpm1','rpm2','steer']){$(id).oninput=labels;if(i
 const drivingKeys=['w','a','s','d','arrowup','arrowdown','arrowleft','arrowright'];
 document.addEventListener('keydown',e=>{if(e.code==='Space'&&!['INPUT','SELECT'].includes(e.target.tagName)){e.preventDefault();keys.clear();send('estop');return;}if(['INPUT','SELECT','TEXTAREA'].includes(e.target.tagName))return;const k=e.key.toLowerCase();if(drivingKeys.includes(k)){e.preventDefault();keys.add(k);}});
 document.addEventListener('keyup',e=>{keys.delete(e.key.toLowerCase());drive();});
-document.addEventListener('focusin',e=>{if(['INPUT','SELECT','TEXTAREA'].includes(e.target.tagName))stop();});
-document.addEventListener('visibilitychange',()=>{if(document.hidden)stop();});window.addEventListener('blur',stop);window.addEventListener('pagehide',stop);window.addEventListener('resize',drawMap);
+document.addEventListener('focusin',e=>{if(['INPUT','SELECT','TEXTAREA'].includes(e.target.tagName))stopManual();});
+document.addEventListener('visibilitychange',()=>{if(document.hidden)stopManual();});window.addEventListener('blur',stopManual);window.addEventListener('pagehide',stopManual);window.addEventListener('resize',drawMap);
 function drive(){
   const c=state?.data.command;if(!c?.armed||c.owner!==session||document.hidden||!document.hasFocus()||performance.now()-lastState>350)return;
   const forward=(keys.has('w')||keys.has('arrowup')?1:0)-(keys.has('s')||keys.has('arrowdown')?1:0);

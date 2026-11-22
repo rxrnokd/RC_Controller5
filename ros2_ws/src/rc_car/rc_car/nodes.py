@@ -38,12 +38,17 @@ class Manager(Base):
         self.pub = self.create_publisher(String, '/rc/command', LATEST)
         self.acks = self.create_publisher(String, '/rc/ack', 20)
         self.actions = self.create_publisher(String, '/rc/action', 5)
+        self.paths = self.create_publisher(String, '/rc/parking_paths', LATEST)
+        self.create_subscription(String, '/rc/localization_health', self.localization, LATEST)
         self.create_subscription(String, '/rc/request', self.request, 20)
         self.create_subscription(String, '/rc/state', self.state, LATEST)
         self.create_timer(0.02, self.tick)
 
     def state(self, msg):
         self.feedback = json.loads(msg.data)
+
+    def localization(self, msg):
+        self.manager.parking.loc = json.loads(msg.data)
 
     def fresh_feedback(self):
         if self.feedback and 0 <= time.monotonic() - self.feedback['at'] < self.cfg['hardware']['feedback_timeout_s']:
@@ -55,6 +60,8 @@ class Manager(Base):
         try:
             cmd = json.loads(msg.data)
             self.manager.handle(cmd, time.monotonic(), self.fresh_feedback())
+            if cmd['type']=='park_result' and self.manager.parking.path_packet:
+                self.send(self.paths,self.manager.parking.path_packet)
             if cmd['type'] == 'zero_trailer':
                 if self.manager.armed:
                     raise ValueError('disarm before trailer zero')
@@ -88,6 +95,7 @@ class Controller(Base):
         self.pwm = [0.0, 0.0]
         self.demand_start = [None, None]
         self.encoder_motion_start = [None, None]
+        self.encoder_lost = [False, False]
         self.pi = [PI(m['kp'], m['ki']) for m in self.cfg['hardware']['motors']]
         self.pub = self.create_publisher(String, '/rc/state', LATEST)
         self.trailer_pub = self.create_publisher(Float64, '/trailer/angle', 5)
@@ -137,6 +145,9 @@ class Controller(Base):
                        and spec['pi_verified'] and spec['max_rpm'] and (spec['kp'] > 0 or spec['ki'] > 0)
                        for m, spec in zip(motors, h['motors']))
         active = bool(c and c['armed'] and not c['estop'] and c['target'] and ready)
+        if active and c['mode']=='AUTO_PARK' and (self.cfg.get('parking',{}).get('commissioned') is not True or c['control']!='PI'):
+            active = False
+            self.fault = 'automatic_output_interlock'
         targets = c['target']['values'] if active else [0.0, 0.0]
         try:
             if c and c['armed'] and c['epoch'] > self.epoch:
@@ -150,7 +161,7 @@ class Controller(Base):
                 self.fault = 'controller_command_timeout'
             if active and dt > 0.15:
                 self.fault = 'control_loop_overrun'
-            if active and c['control'] == 'PI' and not pi_ready:
+            if active and c['control'] == 'PI' and (not pi_ready or any(self.encoder_lost)):
                 self.fault = 'encoder_or_PI_unavailable'
             for i, (target, m) in enumerate(zip(targets, motors)):
                 if active and c['control'] == 'PI' and abs(target) >= h['encoder_demand_rpm']:
@@ -177,7 +188,7 @@ class Controller(Base):
                     if c['control'] == 'PI':
                         target = clip(target, min(c['limits']['rpm'][i], h['motors'][i]['max_rpm']))
                     limit = min(c['limits']['pwm'], h['max_pwm'], 0.99)
-                    self.pwm[i] = pi.step(target, m['rpm'] or 0.0, dt, limit, h['slew_per_s'], now,
+                    self.pwm[i] = pi.step(target, m['rpm'], dt, limit, h['slew_per_s'], now,
                                           h['reversal_deadtime_s'], c['control'] == 'OPEN_LOOP')
                     self.hw.motor(i, self.pwm[i])
         except Exception as exc:
@@ -195,7 +206,12 @@ class Controller(Base):
                 self.encoder_motion_start[i] = None
             stalled = (self.encoder_motion_start[i] is not None and now-self.encoder_motion_start[i] > h['encoder_stall_s']
                        and (m['edge_age_s'] is None or m['edge_age_s'] > h['encoder_stall_s']))
-            m['feedback_valid'] = bool(m['calibrated'] and m['observed'] and m['invalid'] <= h['encoder_max_invalid'] and not stalled)
+            if stalled and m['observed']:
+                self.encoder_lost[i] = True  # unknown distance interval; restart after repair
+            m['feedback_valid'] = bool(m['calibrated'] and m['observed'] and m['invalid'] <= h['encoder_max_invalid'] and not self.encoder_lost[i])
+            if not m['feedback_valid']:
+                for key in ('rpm','rotor_rpm','speed_m_s','distance_m','path_m','revolutions','wheel_revolutions','direction'):
+                    m[key] = None
             m.update(pwm=self.pwm[i], target_rpm=(targets[i] if active and c['control'] == 'PI' else None),
                      target_pwm=(targets[i] if active and c['control'] == 'OPEN_LOOP' else None))
         servo = {'command_rad': self.steering, 'measured_rad': None,
@@ -203,7 +219,7 @@ class Controller(Base):
                  'pulse_us': self.hw.servo.pulse if self.hw.servo else None,
                  'source': 'calibrated_command_estimate'}
         self.send(self.pub, {'at': now, 'stamp': [stamp.sec, stamp.nanosec], 'ready': bool(ready),
-                            'pi_ready': bool(pi_ready), 'fault': self.fault, 'epoch': self.epoch,
+                            'pi_ready': bool(pi_ready and not any(self.encoder_lost)), 'fault': self.fault, 'epoch': self.epoch,
                             'motors': motors, 'servo': servo, 'trailer': trailer,
                             'ultrasonic': ranges, 'sensor_error': self.hw.sensor_error})
         if trailer['angle_rad'] is not None:
