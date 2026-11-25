@@ -8,7 +8,7 @@ import unittest
 
 import yaml
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'ros2_ws/src/rc_car'))
-from rc_car.core import (CommandManager, PI, Quadrature, dumps, encoder_calibrated,
+from rc_car.core import (CommandManager, PI, Quadrature, dumps, encoder_calibrated, lidar_odom_status,
                          integrate, load_config, number, odom_configured, servo_pulse, wheel_targets)
 
 
@@ -34,6 +34,28 @@ class SafetyTests(unittest.TestCase):
         self.assertFalse(cfg['hardware']['enabled'])
         self.assertEqual(cfg['hardware']['max_pwm'], 0)
         self.assertFalse(odom_configured(cfg))
+
+    def test_lidar_source_needs_mount_but_no_wheels_or_servo(self):
+        cfg = load_config('config/vehicle.yaml')
+        cfg['lidar']['enabled'] = True
+        self.assertFalse(odom_configured(cfg))
+        cfg['lidar']['mount_verified'] = True
+        self.assertTrue(odom_configured(cfg))
+        cfg['geometry']['odom_source'] = 'wheel'
+        self.assertFalse(odom_configured(cfg))
+
+    def test_lidar_health_requires_current_successful_registration(self):
+        scan = dict(frame='laser', has_returns=True, stamp_s=9.9)
+        odom = dict(frame='odom', child_frame='base_link', pose_valid=True, stamp_s=9.9)
+        match = dict(stamp_s=9.9, lost=False, inliers_ratio=.8)
+        self.assertTrue(lidar_odom_status(10, scan, odom, match, 'laser')[0])
+        for sample, changes in ((scan, {'stamp_s': 9}), (scan, {'has_returns':False}),
+                                (odom, {'child_frame':'laser'}), (odom, {'pose_valid':False}),
+                                (match, {'lost':True}), (match, {'stamp_s':11}),
+                                (match, {'inliers_ratio':None})):
+            with self.subTest(changes=changes):
+                samples = [dict(s, **changes) if s is sample else s for s in (scan,odom,match)]
+                self.assertFalse(lidar_odom_status(10, *samples, 'laser')[0])
 
     def test_default_estop_requires_arm(self):
         self.send('claim')

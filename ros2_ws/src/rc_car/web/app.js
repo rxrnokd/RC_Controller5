@@ -4,6 +4,7 @@ const fmt = (x, d=2) => typeof x === 'number' && Number.isFinite(x) ? x.toFixed(
 let ws, sequence=0, serverTime=null, state=null, session=null, lastState=0, grid=null, gridCanvas=null;
 const keys=new Set();
 let parkingPaths=null, parkingGeometry={}, goal=null, dragStart=null;
+let mapParts=null;
 function log(message){$('events').textContent=(new Date().toLocaleTimeString()+' '+message+'\n'+$('events').textContent).slice(0,4000);}
 function send(type, extra={}){if(ws?.readyState===WebSocket.OPEN)ws.send(JSON.stringify({v:1,seq:++sequence,type,server_time:serverTime,...extra}));}
 function stop(){keys.clear();send('stop');}
@@ -20,8 +21,10 @@ function connect(){
     const msg=JSON.parse(event.data);
     if(msg.type==='hello'){
       session=msg.session;
+      $('control').querySelector('[value="PI"]').disabled=msg.wheel_pi_configured===false;
       parkingGeometry=msg.parking_config?.parking||{};
       grid=null;gridCanvas=null;goal=null;parkingPaths=null;$('mapEmpty').hidden=false;
+      mapParts=null;
       $('goalText').textContent='목표 미지정';
       for(const [id,value] of [['pwm',msg.limits.pwm],['rpm1',msg.limits.rpm[0]],['rpm2',msg.limits.rpm[1]],['steer',msg.limits.steering]]){$(id).max=value;$(id).value=value;}
       labels();log('접속 완료. 제어권 획득 후 활성화하십시오.');
@@ -31,16 +34,44 @@ function connect(){
       parkingPaths=msg;drawMap();
     } else if(msg.type==='ack'){
       log(msg.ok?`명령 ${msg.seq} 완료${msg.saved?' · '+msg.saved.join(', '):''}`:`거부: ${msg.error}`);
-    } else if(msg.type==='map'){
-      grid=msg;gridCanvas=document.createElement('canvas');gridCanvas.width=msg.width;gridCanvas.height=msg.height;
-      const context=gridCanvas.getContext('2d'), pixels=context.createImageData(msg.width,msg.height);
-      for(let y=0;y<msg.height;y++)for(let x=0;x<msg.width;x++){
-        const value=msg.data[y*msg.width+x], index=((msg.height-1-y)*msg.width+x)*4;
-        const grey=value<0?64:Math.round(235-value*2.1);pixels.data.set([grey,grey+(value<0?8:0),grey+(value<0?12:0),255],index);
+    } else if(msg.type==='map_chunk'){
+      if(!mapParts||mapParts.version!==msg.version||mapParts.next!==msg.offset){
+        mapParts={version:msg.version,width:msg.width,height:msg.height,resolution:msg.resolution,
+          origin:msg.origin,frame:msg.frame,next:0,canvas:document.createElement('canvas')};
+        mapParts.canvas.width=msg.width;mapParts.canvas.height=msg.height;
+        mapParts.pixels=mapParts.canvas.getContext('2d').createImageData(msg.width,msg.height);
       }
-      context.putImageData(pixels,0,0);$('mapEmpty').hidden=true;drawMap();
+      if(mapParts.next===msg.offset&&msg.total===msg.width*msg.height){
+        paintMapCells(mapParts,msg.data,msg.offset);
+        mapParts.next+=msg.data.length;
+        if(mapParts.next===msg.total){
+          mapParts.canvas.getContext('2d').putImageData(mapParts.pixels,0,0);
+          grid={version:mapParts.version,width:mapParts.width,height:mapParts.height,
+            resolution:mapParts.resolution,origin:mapParts.origin,frame:mapParts.frame};
+          gridCanvas=mapParts.canvas;
+          $('mapEmpty').hidden=true;drawMap();
+          mapParts=null;
+        }
+      }
+    } else if(msg.type==='map'){
+      showMap(msg);
     }
   };
+}
+function showMap(msg){
+  grid=msg;gridCanvas=document.createElement('canvas');gridCanvas.width=msg.width;gridCanvas.height=msg.height;
+  const context=gridCanvas.getContext('2d'), pixels=context.createImageData(msg.width,msg.height);
+  paintMapCells({width:msg.width,height:msg.height,pixels},msg.data,0);
+  context.putImageData(pixels,0,0);$('mapEmpty').hidden=true;drawMap();
+}
+function paintMapCells(target,values,offset){
+  const {width,height,pixels}=target;
+  for(let i=0;i<values.length;i++){
+    const value=values[i],cell=offset+i;
+    const index=((height-1-Math.floor(cell/width))*width+cell%width)*4;
+    const grey=value<0?64:Math.round(235-value*2.1);
+    pixels.data.set([grey,grey+(value<0?8:0),grey+(value<0?12:0),255],index);
+  }
 }
 function render(){
   const data=state?.data||{}, command=data.command||{}, vehicle=data.vehicle||{};
@@ -50,7 +81,7 @@ function render(){
   const parking=command.parking||{};
   const phase={idle:'대기',planning:'경로 계산 중',planned:'경로 준비됨',tracking:'경로 추종 중',stopped:'정지',failed:'실패',complete:'주차 완료'};
   $('parkStatus').textContent=[parking.online?'노트북 연결됨':'노트북 오프라인',phase[parking.phase],
-    fresh&&vehicle.motors?.filter(m=>m.feedback_valid).length!==2?'양쪽 엔코더 속도 확인 필요':'',
+    fresh&&state.odom_source!=='lidar'&&vehicle.motors?.filter(m=>m.feedback_valid).length!==2?'양쪽 엔코더 속도 확인 필요':'',
     parking.detail,parking.blocked,parking.error_m!=null?'트레일러 추종 오차 '+fmt(parking.error_m)+' m':''].filter(Boolean).join(' · ');
   const owner=fresh&&commandFresh&&session&&command.owner===session;
   $('plan').disabled=!(owner&&parking.online&&goal&&grid&&goal.version===grid.version&&!command.armed);
@@ -62,7 +93,8 @@ function render(){
   $('reason').textContent=`${commandFresh?(command.armed?'활성화':'출력 차단'):'제어 상태 오래됨'} · ${command.reason||'상태 대기'}${command.estop?' · 비상정지 래치':''}`;
   $('arm').disabled=!fresh||!commandFresh||command.owner!==session||!vehicle.ready;
   $('fresh').textContent=fresh?'실시간 수신':'데이터 없음 / 오래됨';$('fresh').className='badge '+(fresh?'ok':'warn');
-  $('slam').textContent=fresh&&state?.slam_ready?'SLAM 데이터 준비됨':'SLAM 준비 안 됨';$('slam').className='badge '+(fresh&&state?.slam_ready?'ok':'warn');
+  const slamReady=performance.now()-lastState<600&&state?.slam_ready;
+  $('slam').textContent=slamReady?'SLAM 데이터 준비됨':'SLAM 준비 안 됨';$('slam').className='badge '+(slamReady?'ok':'warn');
   $('fault').textContent=vehicle.fault||vehicle.sensor_error||state?.map_error||'';
   for(let i=0;i<2;i++){
     const m=fresh?vehicle.motors?.[i]||{}:{};
@@ -73,11 +105,15 @@ function render(){
   $('trailer').textContent=fmt(trailer?.angle_rad)+' rad';$('trailerStatus').textContent=trailer?.zeroed?`영점 설정됨 · Z ${trailer.index_count}회`:'영점 미설정 / 센서 없음';
   $('servo').textContent=`명령 ${fmt(servo?.command_rad)} rad · 펄스 ${fmt(servo?.pulse_us,0)} μs · 실제각 미측정`;
   $('ranges').replaceChildren(...[0,1,2,3].flatMap(i=>{const r=fresh?vehicle.ultrasonic?.[i]:null;const dt=document.createElement('dt'),dd=document.createElement('dd');dt.textContent='US-'+(i+1);dd.textContent=r?.status==='ok'?fmt(r.m*100,1)+' cm':r?.status||'—';return [dt,dd];}));
-  const pose=fresh&&state?.slam_ready?state.map_pose:null;
-  const match=state?.data.scan_match;
+  const pose=slamReady?state.map_pose:null;
+  const match=state?.odom_source==='lidar'?null:state?.data.scan_match;
   const previewPose=match&&performance.now()-lastState<600&&state.ros_time_s-match.stamp_s>=0&&state.ros_time_s-match.stamp_s<0.5?match:null;
   const shown=pose||previewPose;
   $('pose').textContent=shown?`${pose?'MAP':'스캔 매칭 · 계획 전용'} · x ${fmt(shown.x)} m / y ${fmt(shown.y)} m / yaw ${fmt(shown.yaw)} rad`:'MAP 위치 데이터 없음';
+  if(state?.odom_source==='lidar'&&performance.now()-lastState<600){
+    const odom=data.odometry_status;
+    $('pose').textContent += odom?.valid?' · 라이다 추정 속도 '+fmt(data.odom?.speed_m_s)+' m/s':' · '+(odom?.reason||'라이다 대기');
+  }
   $('mapAge').textContent=grid?`지도 수신 ${fmt(state?.age_s.map,1)}초 전`:'';
   drawMap();
 }
@@ -106,7 +142,7 @@ function drawMap(){
     line([[x,y],[x+Math.cos(a)*grid.resolution*12,y+Math.sin(a)*grid.resolution*12]],'#fd7bc8',3);
     context.beginPath();context.arc(...pixel(x,y),4*devicePixelRatio,0,2*Math.PI);context.fillStyle='#fd7bc8';context.fill();
   }
-  const match=state?.data.scan_match;
+  const match=state?.odom_source==='lidar'?null:state?.data.scan_match;
   const pose=performance.now()-lastState<600?(state?.map_pose||(match&&state.ros_time_s-match.stamp_s>=0&&state.ros_time_s-match.stamp_s<0.5?match:null)):null;
   if(!pose)return;
   const t=state?.data.vehicle?.trailer,h=parkingGeometry.hitch_back_m,b=parkingGeometry.drawbar_m;

@@ -61,7 +61,7 @@ def measured(state, tracking=False):
             or not 0 <= state['server_time']-trailer.get('sampled_at',-math.inf)<0.3):
         raise ValueError('MT6701 각도/영점 필요')
     pose = state.get('map_pose') if state.get('slam_ready') else None
-    if not pose and not tracking:
+    if not pose and not tracking and state.get('odom_source') != 'lidar':
         match = data.get('scan_match',{})
         if 0 <= state['ros_time_s']-match.get('stamp_s',-math.inf)<0.5:
             pose = match

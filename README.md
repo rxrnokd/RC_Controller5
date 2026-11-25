@@ -1,6 +1,6 @@
 # Raspberry Pi 4 RC 차량 · ROS 2 Jazzy
 
-기존 `~/rc_lidar_docker`에 추가하는 초기 구현이다. Raspberry Pi가 차량 제어와 SLAM을 담당하고, 노트북 Python 프로세스가 트레일러 후진 주차 경로와 속도·조향 명령을 계산한다. **현재 DC 모터 엔코더 피드백 불량으로 실제 자동주차는 잠겨 있다.** Windows에서 수행한 수학·제어권 테스트와 Pi에서 필요한 검증은 아래에 구분했다.
+기본 구성은 DC 모터 엔코더를 사용하지 않는다. Raspberry Pi가 RPLIDAR C1 스캔으로 차량 위치와 방향을 추정하고 웹 수동 조종에는 Open-loop PWM을 사용한다. 트레일러 연결각은 MT6701로 측정한다. 노트북에서는 주차 경로를 계획할 수 있으며 실제 자동주차 구동은 잠겨 있다.
 
 기본 설정은 모터/서보/센서/라이다/SLAM 비활성, 최대 PWM 0, 비상정지 래치 상태다. 설정을 채우기 전에도 기존 ROS 환경에서 웹 서버와 상태 노드를 실행할 수 있다. 없는 측정값은 JSON `null`, UI `—`로 표시한다. 임의의 지도·RPM·거리·차량 위치를 만들지 않는다.
 
@@ -36,17 +36,17 @@ Docker web_bridge ── /rc/request ──► command_manager
         │                             ▼
         ├── /rc/state ◄────── vehicle_controller ── GPIO / 커널 PWM
         │                         │
-        │                         ├─ 모터 자체 AB 엔코더 2개
+        │                         ├─ DC 모터 2개 · 수동 PWM
         │                         ├─ MT6701 ABZ (트레일러 전용)
         │                         └─ US-100 4개
         │
-        ├── /odom ◄──── encoder_odometry ◄── /rc/state
+        ├── /odom ◄──── icp_odometry ◄── /scan
         └── /map ◄──── slam_toolbox ◄── /scan (기존 sllidar_ros2)
 
-TF: map ──SLAM──► odom ──엔코더 운동학──► base_link ──실측 고정 TF──► laser
+TF: map ──SLAM Toolbox──► odom ──라이다 스캔 정합──► base_link ──실측 고정 TF──► laser
 ```
 
-서로 다른 프로세스로 실행하는 ROS 노드 4개를 제공한다. 웹 전송이 지연되어도 모터 루프는 독립적으로 명령 만료를 확인한다. Docker 내부 통신은 ROS 토픽을 사용한다. 별도 MQTT, rosbridge, 로그인, API 키, 인증 서버는 없다. ROS DDS는 기본적으로 같은 호스트 안에서만 발견되게 설정하며 노트북은 WebSocket만 사용한다.
+모터 제어, 명령 관리, 웹 서버, 라이다 Odometry는 별도 프로세스에서 실행한다. 모터 루프는 독립적으로 명령 만료를 확인한다. Docker 내부 통신은 ROS 토픽을 사용하고 노트북은 WebSocket으로 연결한다.
 
 | 파일 | 역할 |
 |---|---|
@@ -137,7 +137,7 @@ scp config/vehicle.yaml "${PiTarget}:/tmp/rc-vehicle-template.yaml"
 scp README.md "${PiTarget}:~/rc_lidar_docker/README.md"
 ```
 
-Pi OS에서 기존 보정 파일의 유무에 따라 설정을 반영한다. 처음 설치하면 아래 명령이 기본 설정을 복사한다. 이미 사용 중인 파일이 있으면 실측값을 보존하고 편집기로 템플릿의 새 `parking:` 절만 기존 `config/vehicle.yaml`에 추가한다. 기존 `slam.yaml`은 그대로 사용한다. Python 주차 코드는 노트북에서 실행하므로 노트북 프로젝트 폴더에 둔다.
+처음 설치하면 아래 명령이 기본 설정을 복사한다. 기존 `config/vehicle.yaml`을 사용 중이면 보정값을 보존하고 `geometry` 아래에 `odom_source: lidar`를 추가한다. 두 모터의 `encoder_enabled`는 `false`로 설정하고 `parking:` 절이 없으면 템플릿에서 복사한다. 출처 설정이 없는 이전 파일은 기존 wheel 방식을 사용한다.
 
 ```bash
 cd ~/rc_lidar_docker
@@ -177,7 +177,7 @@ python3 -c 'import rclpy; print("rclpy OK")'
 exit
 ```
 
-호스트에서 기존 이미지를 BASE로 지정해 작은 파생 이미지를 만든다. 제공한 `deploy/Dockerfile.control`은 원래 Dockerfile을 수정하지 않는다. Docker·Ubuntu·ROS 2·SLAM Toolbox·라이다 SDK를 중복 설치하지 않는다. 없는 Python GPIO/웹 라이브러리, colcon, 지도 저장에 필요한 `nav2_map_server`만 apt가 추가한다. 이미 설치된 패키지는 apt가 재사용한다. 기존 이미지의 Ubuntu/Jazzy 저장소가 정상이어야 한다.
+호스트에서 기존 Jazzy 이미지를 BASE로 파생 이미지를 빌드한다. `deploy/Dockerfile.control`이 라이다 Odometry용 `ros-jazzy-rtabmap-odom`, 지도 저장 및 제어 노드의 의존성을 설치한다. 기존 SLAM Toolbox와 C1 드라이버를 재사용한다. 이미 컨테이너가 있으면 새 이미지로 컨테이너를 만들어야 빌드 결과가 반영된다.
 
 ```bash
 cd ~/rc_lidar_docker
@@ -208,7 +208,9 @@ docker logs -f rc-car
 
 브라우저에서 `http://라즈베리파이IP:8080`에 접속한다. 제어부 상태는 출력 비활성, 지도/센서는 없음이어야 정상이다. 아직 연결되지 않은 하드웨어를 정상으로 표시하지 않는다.
 
-### 단계 B: 엔코더 배선·카운트 확인
+### 단계 B. 선택 사항인 모터 엔코더 점검
+
+라이다 전용 구성에서는 B와 D를 건너뛴다.
 
 모터 전원을 분리하고 바퀴를 들어 올린다. 엔코더 전원, A/B HIGH 전압, GND, PH2.0 6핀 배치를 실측한다. `hardware.wiring_verified=true`로 변경하기 전에 GPIO에 5V가 들어가지 않는지 확인한다. 확인한 모터의 `encoder_enabled=true`만 설정해도 raw count를 읽을 수 있으며 모터 출력 `hardware.enabled`는 false로 유지할 수 있다.
 
@@ -255,7 +257,7 @@ calibration:
 
 설정 변경 후 `docker restart rc-car`한다. 웹에서 제어권 획득 → Open-loop → 출력 제한/주행 목표 설정 → 정지 해제/활성화 → W/S 또는 ↑/↓. A/D 또는 ←/→로 조향한다. 스페이스/비상정지 버튼은 래치 정지다. 초기 목표 슬라이더는 0%이며 사용자가 올려야 구동한다. 두 모터의 물리적 전진 방향이 다르면 각 `direction`을 맞춘다. 모터 방향과 엔코더 방향은 별도 설정이다.
 
-### 단계 D: PI 속도 제어
+### 단계 D. 모터 엔코더를 사용하는 차량의 PI 속도 제어
 
 `max_rpm`은 각 모터 **감속 출력축**의 검증된 운전 제한으로 넣는다. 첨부 정격 280RPM 또는 무부하 320RPM을 안전한 최대값으로 자동 적용하지 않았다. `kp`, `ki`는 각각 duty/RPM, duty/(RPM·s)다. 작은 출력·목표에서 먼저 P를 조정한 뒤 I를 조정하며 `pi_verified=true`는 실제 튜닝 후에만 설정한다.
 
@@ -271,7 +273,11 @@ US-100의 UART 점퍼를 제거하고 전압을 검증한 후 `ultrasonic.electr
 
 ### 단계 F: Odometry / 라이다 / SLAM
 
-`base_link` 원점을 **후륜 구동축 중심**으로 정하고 실제 휠베이스·좌우 윤거를 측정한다. 두 구동 모터가 후륜 좌우라는 것을 확인한 뒤 `geometry.verified=true`로 설정한다. 전륜 구동 등 다른 구조라면 현재 모델을 그대로 사용하지 않는다. 좌우 바퀴 평균 이동거리와 보정된 **명령 조향각 추정값**을 쓰는 bicycle model이다. 실측 조향 피드백이 없으므로 `geometry.steering_command_estimate_allowed=true`를 명시적으로 설정해야 Odometry를 발행한다.
+기본 `geometry.odom_source: lidar`에서는 C1 `/scan`을 `rtabmap_odom/icp_odometry`가 정합해 `/odom`과 `odom → base_link`를 발행한다. SLAM Toolbox가 같은 스캔과 이 TF로 지도를 만들고 `map → odom`을 제공한다. 기존 wheel 방식은 `geometry.odom_source: wheel`을 선택할 때만 실행한다. [Jazzy ICP 노드](https://github.com/introlab/rtabmap_ros/blob/jazzy-devel/rtabmap_odom/src/nodelets/icp_odometry.cpp)
+
+라이다 위치만 시험할 때는 모터·서보 전원을 끄고 `hardware.enabled`, 두 모터의 `encoder_enabled`, `servo.enabled`, `parking.commissioned`를 `false`로 둔다. `base_link`는 후륜 차축 중심이다. 라이다의 실제 장착 위치·방향을 측정해 아래 TF 설정에 입력한다. 초기에는 `slam.enabled: false`로 Odometry부터 확인한다.
+
+선택 사항인 wheel 방식의 운동학식은 다음과 같다.
 
 ```text
 v = (v_left + v_right) / 2
@@ -279,7 +285,7 @@ yaw_rate = v × tan(steering_angle) / wheelbase
 Δyaw = Δdistance × tan(steering_angle) / wheelbase
 ```
 
-정확한 원호 적분을 사용하고 후진 부호를 유지한다. 공분산은 설정 가능한 모델 불확실성이고 실험으로 입증한 오차 범위가 아니다. 실제 조향 오차·백래시·미끄러짐 때문에 절대 정확도를 보증할 수 없다. 이미 발행하던 Odometry에 피드백 단절/고장으로 연속성이 끊기면 정상 데이터를 다시 받더라도 자동으로 이어붙이지 않고 재시작을 요구한다. 정지한 후 전체 launch를 다시 시작하여 SLAM도 새 odom 원점과 함께 시작한다.
+wheel 방식에서는 휠베이스·윤거·엔코더·조향 보정과 `geometry.steering_command_estimate_allowed`가 필요하다. 엔코더 없이 사용하는 lidar 방식에서는 이 값들을 Odometry 입력으로 사용하지 않는다.
 
 `lidar.xyz_rpy`에는 base_link에서 본 라이다 원점의 x/y/z(m), roll/pitch/yaw(rad)를 채우고 `mount_verified=true`로 설정한다. `lidar.enabled=true`로 변경한다. USB 경로는 `/dev/serial/by-id/...`로 식별하고 컨테이너에 `/dev/ttyUSB0`으로 전달한다. `LIDAR_DEVICE`는 run.sh에 주는 호스트 경로이며 `lidar.serial_port`는 컨테이너 경로다. USB 장치 추가 시에는 컨테이너를 정지·이름 변경 후 다시 생성해야 한다.
 
@@ -287,7 +293,7 @@ yaw_rate = v × tan(steering_angle) / wheelbase
 # Raspberry Pi OS: 이전 rc-car를 정지하고 보관용 이름으로 바꾼 뒤
 export LIDAR_DEVICE=/dev/serial/by-id/실제장치이름
 export RC_IMAGE=rc-car:local
-bash deploy/run.sh --hardware
+bash deploy/run.sh  # 라이다 단독 점검. 모터·서보 GPIO 장치 불필요
 docker exec -it rc-car bash
 ```
 
@@ -297,15 +303,19 @@ docker exec -it rc-car bash
 source /opt/ros/jazzy/setup.bash
 source /project/.rc_install/setup.bash
 ros2 node list
+ros2 pkg executables rtabmap_odom
 ros2 topic echo /rc/state --once
 ros2 topic hz /scan
 ros2 topic hz /odom
+ros2 topic echo /odom_info_lite --once --field lost --qos-reliability best_effort
 ros2 topic echo /rc/odom_status --once
 ros2 run tf2_ros tf2_echo odom base_link
 ros2 run tf2_ros tf2_echo base_link laser
 ```
 
-실제 카운트·이동 방향·직진 거리·곡선 yaw가 맞고 TF가 준비된 다음 `slam.enabled=true`로 변경하여 재시작한다. `slam.params_file`은 **기존** `/project/config/slam.yaml`을 가리킨다. launch는 해당 파일을 읽고 프레임/scan topic/실시간 clock/use_map_saver/mapping 또는 localization 설정만 임시 YAML에 반영하며 원본을 보존한다. 원본은 `slam_toolbox: ros__parameters:` 구조여야 한다. 원본이 `transform_publish_period: 0`이면 먼저 수정해야 한다.
+모터 전원을 끈 채 바닥에서 차를 천천히 손으로 밀고 돌린다. 줄자로 표시한 직진·후진 거리, 제자리에서 바꾼 방향, 출발점 복귀 오차를 `/odom`과 비교한다. 긴 복도에서 벽이 평행하거나 주변 물체가 움직이면 위치가 흔들리거나 정합이 실패할 수 있다. `/rc/odom_status`의 `valid`가 내려가는지 확인한다. 현장 정확도와 Pi 부하는 아직 측정하지 않았다.
+
+확인 후 `slam.enabled: true`로 변경하고 컨테이너를 재시작한다. `slam.params_file`은 기존 `/project/config/slam.yaml`을 가리킨다. 같은 구역에서 지도와 실측 위치를 비교하고 SLAM 동작 중 `docker stats rc-car`로 Pi 부하도 확인한다. `slam.localization`로 저장 지도를 다시 사용하는 방법은 단계 G를 따른다.
 
 ```bash
 # Docker 내부
@@ -314,7 +324,7 @@ ros2 run tf2_ros tf2_echo map base_link
 ros2 service list | grep slam_toolbox
 ```
 
-웹의 SLAM 준비 표시는 `/map` 존재, 최근 `/scan`, 최근 Odometry 상태/피드백, 유효하고 최근인 `map→base_link` TF를 모두 요구한다. 이는 입력 준비 여부이며 지도 품질 검증을 의미하지 않는다. 오래된 지도는 마지막 수신 시간과 함께 남겨두되 준비 조건이 깨지면 차량 위치를 숨긴다. UI에는 raw `/scan` 포인트 렌더링은 없지만 메시지와 ROS 토픽으로 제공한다.
+웹의 SLAM 준비 표시는 `/map` 존재, 최근 `/scan`, 최근 Odometry 상태/피드백, 유효하고 최근인 `map→base_link` TF를 모두 요구한다. 이는 입력 준비 여부이며 지도 품질 검증을 의미하지 않는다. 오래된 지도는 마지막 수신 시간과 함께 남겨두되 준비 조건이 깨지면 차량 위치를 숨긴다. `/scan` 전체 거리 배열은 ROS 토픽에서 사용한다. 웹 상태에는 스캔 시각, 프레임, 개수 및 유효 반사점 유무만 보낸다.
 
 ### 단계 G: 지도 저장과 재사용
 
@@ -334,6 +344,7 @@ ros2 service list | grep slam_toolbox
 | 키 해제 | 주행 목표 0, 모터 즉시 브레이크 |
 | 수동 조종 탭 숨김/창 blur/입력칸 포커스 | 활성화된 수동 조종자가 stop 요청. 추가로 차량 측 timeout 적용 |
 | WebSocket 종료 | owner release. 전달 실패 시 watchdog |
+| 지연된 명령 한 건 | 해당 명령 거부 및 ACK 오류. 세션은 유지하며 마지막 유효 drive의 watchdog을 계속 적용 |
 | 마지막 정상 drive 이후 기본 0.30초 | manager 정지·비활성화. heartbeat만으로 연장되지 않음 |
 | manager 정지/명령 만료 | controller에서도 독립 확인 후 출력 차단 |
 | controller가 멈춤/강제 종료 | 기본 최대 0.10초 finite motor PWM lease. 실제 종료 파형 검증 필요 |
@@ -342,7 +353,9 @@ ros2 service list | grep slam_toolbox
 | Open-loop에서 엔코더 없음 | 명시적으로 선택한 수동 PWM은 허용. RPM/Odometry 유효성은 별도 처리 |
 | AUTO_PARK 요청 | 정지 상태, 실차 검증 설정, 실제 센서·위치, 동일 지도·시작 자세, 노트북의 완성된 계획 확인 후 PI 제어권 이양 |
 
-기본 `command_timeout_s=0.30`은 **차량이 마지막으로 수락한 명령 이후** 기준이다. 클라이언트는 최신 server_time을 되돌려 보내고 오래된 명령은 거부된다. 네트워크 지연, 명령 허용 나이, loop 주기, finite PWM 잔여 시간이 더해질 수 있으며 실제 최악 정지시간은 계측해야 한다. 운영체제/커널 전체 정지, 전원 장애, 드라이버 고장까지 소프트웨어가 보장하지 않는다. 물리적 비상정지는 독립적으로 필요하다.
+기본 `command_timeout_s=0.30`은 **차량이 마지막으로 수락한 명령 이후** 기준이다. 브라우저는 0.10초마다 drive를 갱신한다. 최신 server_time이 0.30초보다 오래된 명령은 거부된다. 명령 하나가 늦었다고 WebSocket 세션을 해제하지는 않지만, 유효한 drive가 0.30초 동안 들어오지 않으면 차량이 정지하고 수동 재활성화가 필요하다. 이 값은 제어 응답과 정지시간 사이의 안전 한계이며 현재 Pi·Wi-Fi에서 실제 지연과 최악 정지시간을 계측해야 한다. 운영체제/커널 전체 정지, 전원 장애, 드라이버 고장까지 소프트웨어가 보장하지 않는다. 물리적 비상정지는 독립적으로 필요하다.
+
+상태·지도 송신의 짧은 지연은 WebSocket 종료와 분리했다. 서버는 송신에 2초를 허용하고 WebSocket heartbeat를 6초로 설정했다. 실제 연결이 닫히면 브라우저가 재접속하며, 새 세션에서 제어권을 다시 획득해야 한다. 모터 출력은 위 0.30초 watchdog이 먼저 차단한다.
 
 서보는 기본 정지 시 마지막 명령 위치를 유지하여 갑자기 가운데로 움직이지 않는다. `hold_on_stop=false`이면 펄스를 중지하나 하중에 의한 조향 이동이 가능하다. SIGKILL 시 커널 PWM이 남을 수 있고 컨테이너 정지 후 자동으로 센터가 되지는 않는다. 전체 전원 차단 정책을 실제 기계 상태에 맞게 검증한다. UI의 PWM은 **명령한 duty**이지 계측된 파형 값이 아니다.
 
@@ -391,7 +404,7 @@ PI drive는 `speed_m_s` 또는 모터별 출력축 `rpm:[left,right]`를 받는�
 
 기타 명령은 `estop`, `mode`, `zero_trailer`, `save_map` (`name`)이다. 수동 `arm`은 신선한 준비 상태 및 영출력에서 비상정지를 해제하고 새로운 epoch를 만든다. 주차 제어권 이양에는 아래의 별도 정지 상태 절차가 필요하다. ACK는 `{type:"ack",seq,ok,error?}`이며 drive ACK는 목표 수락을 표시한다.
 
-`state`에는 `server_time`, `data.vehicle`, `data.command`, `data.odom`, `data.scan`, `data.odometry_status`, 각 `age_s`, `map_pose`, `slam_ready`가 있다. `map_pose`는 map 좌표계, `data.odom`은 odom 좌표계다. `map` 메시지는 width/height/resolution/origin[x,y,yaw]/data를 갖는다. data는 ROS와 같은 `row=y, column=x` 순서의 -1/0..100 배열이다. UI는 이미지의 Y축 반전과 지도 origin yaw를 반영한다. 지도 최대 크기와 전송 주기는 config에서 제한하며 느린 클라이언트는 연결을 닫아 제어권을 반납한다.
+`state`에는 `server_time`, `data.vehicle`, `data.command`, `data.odom`, `data.scan`, `data.odometry_status`, 각 `age_s`, `map_pose`, `slam_ready`가 있다. `map_pose`는 map 좌표계, `data.odom`은 odom 좌표계다. 지도는 `map_chunk` 여러 개로 전송한다. 각 조각은 공통 `version`, `width`, `height`, `resolution`, `origin[x,y,yaw]`, `offset`, `total`, `data`를 갖는다. data는 ROS와 같은 `row=y, column=x` 순서의 -1/0..100 배열이며, 브라우저와 노트북 클라이언트가 같은 버전의 조각을 모두 받은 뒤 사용한다. 지도 조각 사이에 상태와 ACK를 보내 큰 지도 전송 중 제어 지연을 줄인다. 지도 최대 크기와 전송 주기는 config에서 제한한다.
 
 ### 노트북에서 트레일러 주차 사용하기
 
@@ -406,7 +419,7 @@ python -m pip install numpy scipy PyYAML Pillow aiohttp
 python -m laptop.parking --help
 ```
 
-#### A. 엔코더 수리 전, 저장한 지도에서 경로만 계산
+#### A. 저장한 지도에서 경로만 계산
 
 실제 저장한 Nav2 trinary 지도 YAML과 같은 폴더의 회색조 PGM 또는 기존 WebSocket `map` JSON을 노트북에 둔다. 아래는 명령 형식이다. 파일 경로와 대문자 인자는 측정한 값으로 바꾼다. `--start`는 차량 뒤 차축 중심과 차량 yaw, 연결각이다. `--goal`은 **트레일러 차축 중심**과 트레일러의 최종 앞 방향, 최종 연결각이다. 좌표는 map 기준 m, 각도는 rad이다.
 
@@ -424,9 +437,11 @@ Pi에 이 버전의 ROS 패키지·웹 파일·차량 설정을 반영하고 기
 python -m laptop.parking connect http://192.168.1.42:8080
 ```
 
-같은 주소를 노트북 브라우저에서 열고 **제어권 획득 → 정지 → 지도에서 목표 지점을 누르고 트레일러 앞 방향으로 드래그 → 최종 연결각 입력 → 경로 계획** 순서로 사용한다. 비상정지를 해제하지 않아도 계획할 수 있다. 주황색은 Hybrid A*, 하늘색은 Planning MPC의 트레일러 차축 경로다. 보라색은 현재 차량에서 트레일러 차축까지의 연결을 나타낸다. 수신한 지도와 MT6701 영점·유효각, 최근 map 자세가 필요하다. 유효한 Odometry가 없어도 최근 SLAM 스캔 매칭 자세가 실제로 수신되면 계획을 허용한다. 이때 서보 명령도 없으면 계획의 첫 조향만 중앙으로 가정한다. 화면에 가정한 값을 계측값으로 발행하지 않는다. 지도만 남고 현재 자세가 없으면 A 절차를 사용한다.
+같은 주소를 노트북 브라우저에서 열고 **제어권 획득 → 정지 → 지도에서 목표 지점을 누르고 트레일러 앞 방향으로 드래그 → 최종 연결각 입력 → 경로 계획** 순서로 사용한다. 비상정지 상태에서도 계획할 수 있다. 주황색은 Hybrid A*, 하늘색은 Planning MPC의 트레일러 차축 경로다. 라이다 구성은 유효한 라이다 Odometry와 map 자세, 지도, MT6701 영점·상대각, 실측 치수가 있어야 한다. 서보 명령이 없으면 정지 상태의 첫 조향을 중앙으로 가정한다. 지도만 있으면 A 절차를 사용한다.
 
-#### C. 실차 검증 후 추종
+#### C. 엔코더가 있는 기존 차량의 실차 검증 후 추종
+
+현재 라이다 구성에서는 이 단계를 진행하지 않는다. 라이다가 추정한 차체 속도로 각 모터의 RPM을 측정할 수 없다. 이 구성에서 자동주차를 구동하려면 별도의 차체 속도 제어와 추정 지연·제동거리 검증이 필요하다.
 
 9절의 실측 기록을 완료하고 승인한 설정에서만 관리자가 `commissioned`를 설정한다. 운영자는 정지한 차량에서 계획을 확인하고 **비상정지 해제 (정지 유지) → AUTO_PARK 시작**을 누른다. 양쪽 엔코더의 최근 실제 회전 이력과 정지 속도, PI·조향 상태, 영점이 잡힌 MT6701, 초음파 4개, 신선한 `/scan`·`/odom`·지도 TF와 허용 분산 내 `/pose`가 모두 필요하다. `/pose`가 설치한 SLAM 구성에서 발행되는지, 정지·저속에서도 주차에 필요한 빈도로 갱신되는지 확인한다. 서보 상태에는 보정된 **명령각**을 사용한다. 실제 조향 응답과 명령각 오차를 실측해야 한다. SLAM Toolbox는 처리한 스캔의 시각과 공분산을 자세 메시지에 기록한다. [SLAM Toolbox의 자세 발행 코드](https://github.com/SteveMacenski/slam_toolbox/blob/ros2/src/slam_toolbox_common.cpp)
 
@@ -469,6 +484,7 @@ docker logs --tail 100 rc-car
 - [ ] 브라우저 2개 동시 제어권 충돌, 탭 이동, Wi-Fi 단절, stale/replayed seq, 정지/재활성화 확인
 - [ ] `/odom`, TF 직진/원호/후진 검증, 센서 유실 시 TF 발행 중단 및 재시작 필요 상태 확인
 - [ ] 실제 지도 생성/차량 방향 표시/지도 저장/동일 시작 자세 localization 재사용
+- [ ] 라이다 단독 구성에서 모터 전원을 끄고 직진·후진·회전·출발점 복귀 오차, 스캔 손실·복구, SLAM 동시 처리 주기와 조종 지연 측정
 - [ ] 전원 재공급 후 비상정지 및 자동 미출력 확인
 - [ ] 주차용 치수·연결각 부호·전후진 궤적을 실제 기록과 비교하고 차량/트레일러/히치의 여유 거리 및 간섭 한계 측정
 - [ ] 실측 지도와 시작 자세로 경로 검토, 기록된 센서로 추종 오차·연산 시간 확인, 계측한 저속 정지거리로 초음파 한계·속도 상한 결정
@@ -490,7 +506,7 @@ docker logs --tail 100 rc-car
 | RPM/거리 30배 오류 | motor CPR와 output CPR 혼동 여부, gear_ratio 확인 |
 | 카운트 방향 반대 | 모터 direction과 encoder_direction을 독립 검증. PI를 먼저 끄고 정지 |
 | 엔코더 과다 오류/계측 불일치 | 배선 노이즈/전압/풀업/배선 길이/최대 이벤트율/CPU 지연 확인 |
-| SLAM 실행 거부 | 휠베이스/윤거/서보 추정 허용/엔코더 보정/라이다 mount_verified 누락 확인 |
+| SLAM 실행 거부 | lidar 소스이면 C1 활성화, 실측 `xyz_rpy`, `mount_verified`, 컨테이너의 `rtabmap_odom` 패키지를 확인. wheel 소스이면 엔코더·조향·차량 치수 보정도 확인 |
 | `/scan` 없음 | 기존 컨테이너 점유, USB/by-id, C1 460800, 전원/예열, 드라이버 로그 확인 |
 | 지도는 있지만 위치 없음 | odom_status, TF 신선도, scan 신선도 확인. 화면이 자동으로 가짜 위치를 만들지 않음 |
 | 지도 저장 오류 | use_map_saver 서비스, nav2_map_server, maps 쓰기권한, 이름 중복, 부분 파일 확인 |

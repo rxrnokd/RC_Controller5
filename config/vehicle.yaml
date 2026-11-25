@@ -82,6 +82,7 @@ ultrasonic:
     - {name: us3, trig: 24, echo: 25}
     - {name: us4, trig: 5, echo: 6}
 geometry:
+  odom_source: lidar         # lidar scan matching; wheel selects the encoder backend
   verified: false
   layout: rear_axle_left_right # controller/odometry assume both driven wheels on rear axle
   wheelbase_m: null

@@ -3,10 +3,10 @@
 <title>RC · Vehicle Console</title><link rel="stylesheet" href="/style.css"><script defer src="/app.js"></script></head>
 <body><header><div><small>RASPBERRY PI · ROS 2</small><h1>Vehicle Console</h1></div><div id="connection" class="badge">연결 대기</div><button id="estop" class="danger">비상정지 · SPACE</button></header>
 <main><section class="map-panel"><div class="map-heading"><div><small>LIVE MAPPING</small><h2>주행 공간</h2></div><span id="slam" class="badge">SLAM 준비 안 됨</span></div>
-<div class="map-wrap"><canvas id="map"></canvas><div id="mapEmpty">수신한 지도가 없습니다.<br><small>엔코더 · 조향 보정 · TF가 준비되어야 지도 생성이 가능합니다.</small></div></div>
+<div class="map-wrap"><canvas id="map"></canvas><div id="mapEmpty">수신한 지도가 없습니다.<br><small>라이다 스캔 · 장착 TF · Odometry · SLAM 상태를 확인하세요.</small></div></div>
 <div class="map-footer"><span id="pose">위치 데이터 없음</span><span>화살표: 차량 · 회색: 미탐색</span></div>
 <div class="save"><input id="mapName" placeholder="지도 이름 (영문/숫자)" maxlength="64"><button id="save">지도 + Pose graph 저장</button><span id="mapAge">—</span></div>
-<p class="note">지도는 마지막 수신 자료입니다. 스캔 매칭 위치만 있으면 계획 전용으로 표시합니다. 보라색 선은 MT6701 연결각과 실측 치수로 계산한 트레일러 자세입니다.</p></section>
+<p class="note">지도는 마지막 수신 자료입니다. 라이다 위치 추정이 끊기면 차량 화살표를 숨깁니다. 보라색 선은 MT6701 연결각과 실측 치수로 계산한 트레일러 자세입니다.</p></section>
 <aside><section class="card"><div class="row"><h2>제어권</h2><span id="mode" class="badge">MANUAL</span></div><p id="owner">관찰 모드</p>
 <div class="buttons"><button id="claim">제어권 획득</button><button id="release">반납</button><button id="arm">정지 해제 / 활성화</button><button id="stop">정지</button></div>
 <div class="row"><label>제어 방식 <select id="control"><option value="OPEN_LOOP">Open-loop PWM</option><option value="PI">PI · 엔코더 RPM</option></select></label></div>

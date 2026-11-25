@@ -14,6 +14,7 @@ class VehicleClient:
         self.server_time = None
         self.received_at = 0
         self.state = self.map = None
+        self.map_parts = None
         self.pending = {}
         self.owns_control = False
         self.hello = {}
@@ -42,6 +43,20 @@ class VehicleClient:
                 self.received_at = time.monotonic()
             elif payload['type'] == 'map':
                 self.map = payload
+            elif payload['type'] == 'map_chunk':
+                if (self.map_parts is None or self.map_parts['version'] != payload['version']
+                        or self.map_parts['received'] != payload['offset']):
+                    self.map_parts = dict(version=payload['version'], received=0, data=[],
+                                          width=payload['width'], height=payload['height'],
+                                          resolution=payload['resolution'], origin=payload['origin'],
+                                          frame=payload['frame'])
+                if self.map_parts['received'] == payload['offset']:
+                    self.map_parts['data'].extend(payload['data'])
+                    self.map_parts['received'] += len(payload['data'])
+                    if self.map_parts['received'] == payload['total']:
+                        self.map = dict(self.map_parts, type='map')
+                        self.map.pop('received')
+                        self.map_parts = None
             elif payload['type'] == 'ack':
                 future = self.pending.get(payload['seq'])
                 if future and not future.done():

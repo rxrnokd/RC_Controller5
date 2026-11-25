@@ -3,7 +3,7 @@ ARG BASE_IMAGE
 FROM ${BASE_IMAGE}
 USER root
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    python3-lgpio python3-aiohttp python3-yaml python3-colcon-common-extensions ros-jazzy-nav2-map-server \
+    python3-lgpio python3-aiohttp python3-yaml python3-colcon-common-extensions ros-jazzy-nav2-map-server ros-jazzy-rtabmap-odom \
     && rm -rf /var/lib/apt/lists/*
 WORKDIR /project
 ENTRYPOINT ["/bin/bash", "/project/deploy/entrypoint.sh"]

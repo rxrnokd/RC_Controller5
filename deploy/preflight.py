@@ -14,7 +14,7 @@ def main():
     for name in ('rclpy', 'lgpio', 'aiohttp', 'yaml'):
         print(f'{name}: {"available" if importlib.util.find_spec(name) else "NOT installed in this environment"}')
     print('Motor outputs:', 'ENABLED BY CONFIGURATION' if cfg['hardware']['enabled'] else 'DISABLED')
-    print('Encoder odometry configuration:', 'complete; hardware NOT verified here' if odom_configured(cfg) else 'incomplete; no odom/TF published')
+    print('Odometry source:', cfg['geometry']['odom_source'], 'configured' if odom_configured(cfg) else 'waiting for configuration')
     paths = [f"/dev/gpiochip{cfg['hardware']['gpiochip']}", cfg['servo']['pwmchip'], cfg['lidar']['serial_port'], cfg['slam']['params_file']]
     for path in paths:
         print(f'{path}: exists={Path(path).exists()}, read={os.access(path, os.R_OK)}, write={os.access(path, os.W_OK)}')

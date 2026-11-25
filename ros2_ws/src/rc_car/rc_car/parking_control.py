@@ -37,6 +37,8 @@ def pose_matches(p, loc, f, target, trailer_goal=False):
 
 def feedback_problem(cfg, f, loc, now, moving=False):
     p = cfg.get('parking', {})
+    if cfg['geometry']['odom_source']=='lidar':
+        return '라이다 위치 추정 · 자동주차는 경로 계획만 가능'
     if p.get('commissioned') is not True:
         return '실차 검증 잠금'
     timeout = cfg['network']['command_timeout_s']

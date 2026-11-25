@@ -28,6 +28,7 @@ def load_config(path):
     with open(path, encoding='utf-8') as stream:
         cfg = yaml.safe_load(stream)
     h, s, t, u, g, n = (cfg[k] for k in ('hardware', 'servo', 'trailer', 'ultrasonic', 'geometry', 'network'))
+    require(g.setdefault('odom_source','wheel') in ('lidar','wheel'), 'geometry.odom_source must be lidar or wheel')
     for section in (h, s, t, u, g, cfg['lidar'], cfg['slam'], *h['motors']):
         for key, value in section.items():
             if key in ('enabled', 'calibrated', 'verified', 'hold_on_stop', 'localization', 'encoder_enabled', 'steering_command_estimate_allowed') or key.endswith('_verified'):
@@ -116,6 +117,7 @@ def load_config(path):
     if parking:
         require(type(parking.get('commissioned')) is bool, 'parking.commissioned must be boolean')
     if parking.get('commissioned'):
+        require(g['odom_source']=='wheel','AUTO_PARK drive requires qualified wheel feedback')
         require(odom_configured(cfg) and h['enabled'] and t['enabled'] and u['enabled']
                 and all(m['pi_verified'] for m in h['motors'])
                 and cfg['lidar']['mount_verified'] and cfg['slam']['enabled'], 'automatic driving calibration incomplete')
@@ -133,9 +135,27 @@ def encoder_calibrated(m):
 
 
 def odom_configured(c):
+    if c['geometry']['odom_source']=='lidar':
+        return c['lidar']['enabled'] and c['lidar']['mount_verified']
     return bool(c['geometry']['verified'] and c['geometry']['steering_command_estimate_allowed']
                 and c['servo']['enabled'] and c['servo']['calibrated']
                 and all(encoder_calibrated(m) for m in c['hardware']['motors']))
+
+
+def lidar_odom_status(ros_now, scan, odom, registration, frame):
+    """Qualify scan odometry from sensor timestamps, not web receipt times."""
+    for sample in (scan, odom, registration):
+        stamp = sample.get('stamp_s', 0)
+        if not stamp or not 0 <= ros_now - stamp < 0.5:
+            return False, '최근 스캔·라이다 Odometry·정합 상태 대기'
+    if scan.get('frame') != frame or not scan.get('has_returns'):
+        return False, '라이다 프레임 또는 반사점 확인 필요'
+    ratio = registration.get('inliers_ratio')
+    if registration['lost'] or ratio is None or not 0 < ratio <= 1:
+        return False, '라이다 스캔 정합 실패'
+    if odom['frame'] != 'odom' or odom['child_frame'] != 'base_link' or not odom.get('pose_valid'):
+        return False, '라이다 Odometry 자세 오류'
+    return True, '라이다 스캔 정합'
 
 
 def dumps(obj):

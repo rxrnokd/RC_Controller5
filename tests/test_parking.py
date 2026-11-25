@@ -26,7 +26,7 @@ except ModuleNotFoundError as exc:
 
 def config():
     cfg = load_config(ROOT / 'config/vehicle.yaml')
-    cfg['geometry'].update(verified=True, wheelbase_m=.32, track_m=.22)
+    cfg['geometry'].update(odom_source='wheel', verified=True, wheelbase_m=.32, track_m=.22)
     cfg['servo'].update(max_angle_rad=.45, slew_rad_s=.6)
     cfg['hardware']['max_pwm'] = .2
     for m in cfg['hardware']['motors']:
@@ -185,6 +185,8 @@ class GeometryTests(unittest.TestCase):
             sampled_at=10.,zeroed=True,invalid=0,angle_rad=.1)),scan_match=dict(stamp_s=54.9,x=1,y=2,yaw=.3)))
         self.assertEqual(measured(state),(Pose(1,2,.3,.1),None,None))
         with self.assertRaisesRegex(ValueError,'map'):
+            measured(dict(state,odom_source='lidar'))
+        with self.assertRaisesRegex(ValueError,'map'):
             measured(state,True)
         state['ros_time_s']+=1
         with self.assertRaises(ValueError):
@@ -221,6 +223,12 @@ class ParkingInterlockTests(unittest.TestCase):
         self.cfg['parking']['commissioned']=False
         with self.assertRaisesRegex(ValueError,'실차'):
             self.send('mode',mode='AUTO_PARK')
+        self.assertFalse(self.manager.armed)
+
+    def test_lidar_pose_cannot_authorize_motor_drive(self):
+        self.cfg['geometry']['odom_source']='lidar'
+        with self.assertRaisesRegex(ValueError,'경로 계획만'):
+            self.start()
         self.assertFalse(self.manager.armed)
 
     def test_wrong_start_or_stale_pose_rejected(self):

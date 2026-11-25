@@ -22,7 +22,7 @@ from slam_toolbox.srv import SaveMap, SerializePoseGraph
 from ament_index_python.packages import get_package_share_directory
 
 from .nodes import Base, LATEST
-from .core import dumps, number
+from .core import dumps, encoder_calibrated, lidar_odom_status, number, odom_configured
 
 
 def yaw(q):
@@ -42,10 +42,19 @@ class Bridge(Base):
         self.create_subscription(PoseWithCovarianceStamped,'/pose',self.scan_match,qos_profile_sensor_data)
         self.create_timer(0.1,self.publish_health)
         self.map_error = None
-        for topic, key in (('/rc/state', 'vehicle'), ('/rc/command', 'command'), ('/rc/odom_status', 'odometry_status')):
+        self.odom_source = self.cfg['geometry']['odom_source']
+        topics = [('/rc/state', 'vehicle'), ('/rc/command', 'command')]
+        if self.odom_source == 'lidar':
+            self.odom_status_pub = self.create_publisher(String, '/rc/odom_status', LATEST)
+            if odom_configured(self.cfg):
+                from rtabmap_msgs.msg import OdomInfo
+                self.create_subscription(OdomInfo, '/odom_info_lite', self.registration, qos_profile_sensor_data)
+        else:
+            topics.append(('/rc/odom_status', 'odometry_status'))
+        for topic, key in topics:
             self.create_subscription(String, topic, lambda msg, k=key: self.cache(k, json.loads(msg.data)), LATEST)
         self.create_subscription(String, '/rc/ack', self.ack, 20)
-        self.create_subscription(Odometry, '/odom', self.odom, 5)
+        self.create_subscription(Odometry, '/odom', self.odom, qos_profile_sensor_data)
         self.create_subscription(LaserScan, '/scan', self.scan, qos_profile_sensor_data)
         qos = QoSProfile(depth=1, durability=DurabilityPolicy.TRANSIENT_LOCAL, reliability=ReliabilityPolicy.RELIABLE)
         self.create_subscription(OccupancyGrid, '/map', self.map, qos)
@@ -67,9 +76,19 @@ class Bridge(Base):
                 return
             queue.put_nowait(ack)
 
+    def registration(self, msg):
+        ratio = msg.icp_inliers_ratio
+        self.cache('registration', {'stamp_s': Time.from_msg(msg.header.stamp).nanoseconds/1e9,
+                                    'lost': msg.lost, 'inliers_ratio': ratio if math.isfinite(ratio) else None})
+
     def odom(self, msg):
-        self.cache('odom', {'x': msg.pose.pose.position.x, 'y': msg.pose.pose.position.y,
-                            'yaw': yaw(msg.pose.pose.orientation), 'speed_m_s': msg.twist.twist.linear.x,
+        p, q = msg.pose.pose.position, msg.pose.pose.orientation
+        valid = (all(map(math.isfinite, (p.x,p.y,q.x,q.y,q.z,q.w)))
+                 and abs(q.x*q.x+q.y*q.y+q.z*q.z+q.w*q.w - 1.0) < 0.01)
+        speed = msg.twist.twist.linear.x
+        self.cache('odom', {'x': p.x if valid else None, 'y': p.y if valid else None,
+                            'yaw': yaw(q) if valid else None, 'pose_valid': valid,
+                            'speed_m_s': speed if valid and math.isfinite(speed) and msg.twist.covariance[0]<9999 else None,
                             'frame': msg.header.frame_id, 'child_frame': msg.child_frame_id,
                             'stamp_s': Time.from_msg(msg.header.stamp).nanoseconds/1e9})
 
@@ -86,6 +105,8 @@ class Bridge(Base):
 
     def publish_health(self):
         state = self.telemetry(None)
+        if self.odom_source == 'lidar':
+            self.send(self.odom_status_pub, state['data']['odometry_status'])
         p = self.cfg.get('parking',{})
         match = self.latest.get('scan_match') or {}
         stamp_now = self.get_clock().now().nanoseconds/1e9
@@ -106,7 +127,7 @@ class Bridge(Base):
         ranges = [v if math.isfinite(v) and msg.range_min <= v <= msg.range_max else None for v in msg.ranges]
         self.cache('scan', {'frame': msg.header.frame_id, 'stamp_s': Time.from_msg(msg.header.stamp).nanoseconds/1e9, 'angle_min': msg.angle_min,
                             'angle_increment': msg.angle_increment,
-                            'ranges': ranges, 'has_returns': any(v is not None for v in ranges)})
+                            'count': len(ranges), 'has_returns': any(v is not None for v in ranges)})
 
     def map(self, msg):
         if msg.header.frame_id != 'map' or msg.info.width * msg.info.height > self.cfg['network']['max_map_cells']:
@@ -144,12 +165,23 @@ class Bridge(Base):
                         'yaw': yaw(tf.transform.rotation), 'frame': 'map', 'tf_age_s': tf_age}
         except TransformException:
             pass
-        odom_valid = (age.get('odometry_status', 999) < 0.6 and self.latest.get('odometry_status', {}).get('valid', False)
-                      and age.get('vehicle', 999) < 0.6 and age.get('odom', 999) < 0.6)
-        ready = bool(odom_valid and pose and self.grid and age.get('scan', 999) < 0.6)
+        stamp_now = self.get_clock().now().nanoseconds / 1e9
+        data = self.latest.copy()
+        if self.odom_source == 'lidar':
+            odom_valid, reason = lidar_odom_status(stamp_now, data.get('scan',{}), data.get('odom',{}),
+                                                   data.get('registration',{}), self.cfg['lidar']['frame'])
+            data['odometry_status'] = dict(valid=odom_valid, source='lidar', reason=reason, at=now)
+            if not odom_valid:
+                data['odom'] = None
+        else:
+            odom_valid = (age.get('odometry_status', 999) < 0.6 and data.get('odometry_status', {}).get('valid', False)
+                          and age.get('vehicle', 999) < 0.6 and age.get('odom', 999) < 0.6)
+        # A preloaded map and an initial identity map->odom TF can precede the first matched scan.
+        mapped = self.odom_source != 'lidar' or 'scan_match' in data
+        ready = bool(odom_valid and mapped and pose and self.grid and not self.map_error and age.get('scan', 999) < 0.6)
         return {'v': 1, 'type': 'state', 'server_time': now, 'session': session,
-                'data': self.latest, 'age_s': age, 'map_pose': pose if ready else None,
-                'ros_time_s': self.get_clock().now().nanoseconds/1e9,
+                'data': data, 'age_s': age, 'map_pose': pose if ready else None,
+                'ros_time_s': stamp_now, 'odom_source': self.odom_source,
                 'map_version':self.grid_id, 'slam_ready': ready, 'map_error': self.map_error,
                 'auto_available': self.latest.get('command',{}).get('auto_available',False)}
 
@@ -231,7 +263,9 @@ async def serve(node):
     async def websocket(request):
         if len(node.clients) >= cfg['max_clients']:
             raise web.HTTPServiceUnavailable(text='client limit')
-        ws = web.WebSocketResponse(heartbeat=2, max_msg_size=65536)
+        # Drive expiry is handled by the manager. A brief Wi-Fi stall must not
+        # tear down the observer/control session itself.
+        ws = web.WebSocketResponse(heartbeat=6, max_msg_size=65536)
         await ws.prepare(request)
         session = uuid.uuid4().hex  # routing/ownership ID, not an authentication token
         queue = asyncio.Queue(maxsize=32)
@@ -240,23 +274,41 @@ async def serve(node):
 
         async def sender():
             map_version, map_at = -1, 0.0
+            map_snapshot, map_offset = None, 0
             path_id = None
             hello = {'type': 'hello', 'v': 1, 'session': session,
                      'limits': {'pwm': node.cfg['hardware']['max_pwm'],
                                 'rpm': [m['max_rpm'] or 0 for m in node.cfg['hardware']['motors']],
                                 'steering': node.cfg['servo']['max_angle_rad'] or 0}}
             hello['parking_config'] = {k:node.cfg[k] for k in ('geometry','servo','parking') if k in node.cfg}
+            hello['wheel_pi_configured'] = all(encoder_calibrated(m) and m['pi_verified']
+                                              for m in node.cfg['hardware']['motors'])
             await ws.send_str(dumps(hello))
             while not ws.closed:
                 while not queue.empty():
-                    await asyncio.wait_for(ws.send_str(dumps(queue.get_nowait())), 0.3)
-                await asyncio.wait_for(ws.send_str(dumps(node.telemetry(session))), 0.3)
+                    await asyncio.wait_for(ws.send_str(dumps(queue.get_nowait())), 2)
+                await asyncio.wait_for(ws.send_str(dumps(node.telemetry(session))), 2)
                 if node.paths and path_id != node.paths['job_id']:
                     path_id=node.paths['job_id']
-                    await asyncio.wait_for(ws.send_str(dumps(node.paths)),0.5)
-                if node.grid and map_version != node.grid_id and time.monotonic() - map_at >= cfg['map_period_s']:
-                    map_version, map_at = node.grid_id, time.monotonic()
-                    await asyncio.wait_for(ws.send_str(dumps(node.grid)), 0.5)
+                    await asyncio.wait_for(ws.send_str(dumps(node.paths)), 2)
+                if (map_snapshot is None and node.grid and map_version != node.grid_id
+                        and time.monotonic() - map_at >= cfg['map_period_s']):
+                    map_snapshot, map_offset = node.grid, 0
+                    map_at = time.monotonic()
+                if map_snapshot:
+                    # Bound each frame so map delivery cannot monopolize status/ACK traffic.
+                    cells = map_snapshot['data']
+                    for _ in range(4):
+                        if map_offset >= len(cells):
+                            break
+                        end = min(map_offset + 4096, len(cells))
+                        packet = {key: value for key, value in map_snapshot.items() if key != 'data'}
+                        packet.update(type='map_chunk', offset=map_offset, total=len(cells),
+                                      data=cells[map_offset:end])
+                        await asyncio.wait_for(ws.send_str(dumps(packet)), 2)
+                        map_offset = end
+                    if map_offset >= len(cells):
+                        map_version, map_snapshot = map_snapshot['version'], None
                 await asyncio.sleep(1 / cfg['state_hz'])
 
         async def run_sender():
@@ -307,7 +359,6 @@ async def serve(node):
                     else:
                         node.request(session, payload)
                 except (ValueError, TypeError, KeyError) as exc:
-                    node.request(session, {'type': 'release', 'seq': seq})
                     if not queue.full():
                         queue.put_nowait({'type': 'ack', 'seq': payload.get('seq') if isinstance(payload, dict) else None, 'ok': False, 'error': str(exc)})
         finally:

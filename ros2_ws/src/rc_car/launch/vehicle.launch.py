@@ -10,6 +10,7 @@ from launch.event_handlers import OnProcessExit
 from launch.launch_description_sources import PythonLaunchDescriptionSource
 from launch.substitutions import LaunchConfiguration
 from launch_ros.actions import Node
+from launch_ros.parameter_descriptions import ParameterValue
 from rc_car.core import load_config, odom_configured, require
 
 
@@ -17,7 +18,11 @@ def launch_nodes(context):
     path = LaunchConfiguration('config').perform(context)
     cfg = load_config(path)
     actions = []
-    for executable in ('command_manager', 'vehicle_controller', 'odometry', 'web_bridge'):
+    wheel = cfg['geometry']['odom_source']=='wheel'
+    executables = ['command_manager', 'vehicle_controller', 'web_bridge']
+    if wheel:
+        executables.append('odometry')
+    for executable in executables:
         node = Node(package='rc_car', executable=executable, output='screen', parameters=[{'config': path, 'use_sim_time': False}])
         actions.append(node)
         actions.append(RegisterEventHandler(OnProcessExit(target_action=node, on_exit=[EmitEvent(event=Shutdown(reason=f'{executable} exited'))])))
@@ -33,8 +38,21 @@ def launch_nodes(context):
         actions.append(IncludeLaunchDescription(PythonLaunchDescriptionSource(launch), launch_arguments={
             'serial_port': lidar['serial_port'], 'serial_baudrate': str(lidar['serial_baudrate']),
             'frame_id': lidar['frame'], 'inverted': 'false', 'angle_compensate': 'true'}.items()))
+    if not wheel and odom_configured(cfg):
+        # RTAB-Map core parameters are strings; native ROS parameters are typed.
+        icp_params = {key: ParameterValue(value, value_type=str) for key, value in {
+            'Reg/Force3DoF': 'true', 'Icp/PointToPlane': 'true',
+            'Icp/PointToPlaneLowComplexityStrategy': '0', 'Odom/ResetCountdown': '0',
+        }.items()}
+        icp = Node(package='rtabmap_odom', executable='icp_odometry', output='screen',
+                   parameters=[dict(icp_params, frame_id='base_link', odom_frame_id='odom',
+                                    publish_tf=True, publish_null_when_lost=False, qos=2,
+                                    wait_imu_to_init=False, use_sim_time=False)])
+        actions.append(icp)
+        actions.append(RegisterEventHandler(OnProcessExit(target_action=icp, on_exit=[
+            EmitEvent(event=Shutdown(reason='lidar odometry exited'))])))
     if cfg['slam']['enabled']:
-        require(odom_configured(cfg) and lidar['enabled'] and lidar['mount_verified'], 'SLAM requires calibrated odometry and lidar TF')
+        require(odom_configured(cfg) and lidar['enabled'] and lidar['mount_verified'], 'SLAM requires configured odometry source and measured lidar TF')
         with open(cfg['slam']['params_file'], encoding='utf-8') as stream:
             parameters = yaml.safe_load(stream)
         settings = parameters['slam_toolbox']['ros__parameters']
